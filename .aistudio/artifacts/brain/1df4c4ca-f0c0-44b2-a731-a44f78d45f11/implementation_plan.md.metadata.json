@@ -1,0 +1,6 @@
+{
+  "summary":  "Implementation plan for final polish of AuraReserve: (1) Full Display Unit synchronization across Segment Roll-Up table, PYD charts, percentage thresholds, and dynamic Audit Memo period labels, (2) Multi-Sheet Excel Workbook (.xlsx) Export covering Triangles & LDFs, Method Comparison (CL/BF/CC), PYD & Segment Attribution, and Stochastic/Audit Governance, and (3) Cleaned & Joined Normalized Dataset Export (.csv and .xlsx).",
+  "updatedAt":  "2026-10-31T06:45:20.261662571Z",
+  "requestFeedback":  true,
+  "userFacing":  true
+}

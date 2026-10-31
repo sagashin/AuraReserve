@@ -1,0 +1,6 @@
+{
+  "name": "AuraReserve — Cloud-Native Loss Reserving & Actuarial Platform",
+  "description": "Next-generation actuarial loss reserving platform featuring interactive link-ratio outlier exclusion, Chain Ladder / Bornhuetter-Ferguson / Cape Cod methods, Mack's stochastic model, Tail Curve Fitting, and ODP Bootstrap IFRS 17 / Solvency II risk capital simulation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
