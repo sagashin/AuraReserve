@@ -41,16 +41,26 @@ export function buildActuarialValuationWorkbook(
   } = params;
 
   const wb = XLSX.utils.book_new();
-  const devHeaders = evaluation.devPeriods.map((d) => `${d}m`);
-  const linkHeaders = evaluation.devPeriods
+  const rows = evaluation.rows ?? [];
+  const devPeriods =
+    evaluation.devPeriods ??
+    Array.from(
+      { length: evaluation.cumulativeTriangle[0]?.length ?? 0 },
+      (_, idx) => (idx + 1) * 12
+    );
+  const devHeaders = devPeriods.map((d) => `${d}m`);
+  const linkHeaders = devPeriods
     .slice(0, -1)
-    .map((d, j) => `${d}-${evaluation.devPeriods[j + 1]}m`);
+    .map((d, j) => `${d}-${devPeriods[j + 1]}m`);
+
+  const averages = evaluation.ldfAverages;
+  const completedTri = evaluation.fullProjectedTriangle;
 
   // ==========================================================================
   // Sheet 1: 01_Triangle_And_LDFs
   // ==========================================================================
   const sheet1AoA: (string | number | null)[][] = [
-    [`AuraReserve Actuarial Reserve & LDF Workbook — ${datasetName}`],
+    [`Actuarial Reserve & LDF Workbook — ${datasetName}`],
     [
       `Valuation: ${pydAnalysis.currentValuationLabel}`,
       `Baseline: ${pydAnalysis.baselineValuationLabel}`,
@@ -58,66 +68,71 @@ export function buildActuarialValuationWorkbook(
       `Display Unit: ${unitLabel}`,
     ],
     [],
-    ['[1A] Cumulative Triangle (C_i,j)'],
-    ['Origin Period', ...devHeaders, 'Latest Cumulative'],
+    ['[1A] Cumulative Paid Triangle (C_i,j)'],
+    ['Origin Period', ...devHeaders, 'Latest Paid', 'Case Reserve (OS)'],
     ...evaluation.cumulativeTriangle.map((row, i) => [
-      originLabels[i] ?? `${evaluation.originYears[i]}`,
+      originLabels[i] ?? String(rows[i]?.originYear ?? `Origin_${i + 1}`),
       ...row.map((v) => (v === null ? null : Number(v.toFixed(2)))),
-      Number((evaluation.rows[i]?.latestCumulative ?? 0).toFixed(2)),
+      Number((rows[i]?.latestCumulative ?? 0).toFixed(2)),
+      Number((rows[i]?.caseReserveOs ?? 0).toFixed(2)),
     ]),
     [],
-    ['[1B] Incremental Triangle (I_i,j)'],
+    ['[1B] Incremental Paid Triangle (I_i,j)'],
     ['Origin Period', ...devHeaders],
     ...evaluation.incrementalTriangle.map((row, i) => [
-      originLabels[i] ?? `${evaluation.originYears[i]}`,
+      originLabels[i] ?? String(rows[i]?.originYear ?? `Origin_${i + 1}`),
       ...row.map((v) => (v === null ? null : Number(v.toFixed(2)))),
     ]),
     [],
     ['[1C] Full Chain-Ladder Projected Triangle'],
     ['Origin Period', ...devHeaders, 'Selected Ultimate'],
-    ...evaluation.fullProjectedTriangle.map((row, i) => [
-      originLabels[i] ?? `${evaluation.originYears[i]}`,
+    ...completedTri.map((row, i) => [
+      originLabels[i] ?? String(rows[i]?.originYear ?? `Origin_${i + 1}`),
       ...row.map((v) => (v === null ? null : Number(v.toFixed(2)))),
-      Number((evaluation.rows[i]?.selectedUltimate ?? 0).toFixed(2)),
+      Number((rows[i]?.selectedUltimate ?? 0).toFixed(2)),
     ]),
     [],
     ['[1D] Age-to-Age Link Ratios (f_i,j) & Selected LDF Schedule'],
     ['Origin / Average Basis', ...linkHeaders, 'Tail Factor'],
     ...evaluation.linkRatios.map((row, i) => [
-      originLabels[i] ?? `${evaluation.originYears[i]}`,
-      ...row.map((v, j) =>
-        v === null
-          ? null
-          : evaluation.exclusions[i]?.[j]
-          ? `${v.toFixed(4)} (Excluded)`
-          : Number(v.toFixed(4))
-      ),
+      originLabels[i] ?? String(rows[i]?.originYear ?? `Origin_${i + 1}`),
+      ...row.map((v) => (v === null ? null : Number(v.toFixed(4)))),
       null,
     ]),
     [],
     [
       'Volume-Weighted Avg (All)',
-      ...evaluation.ldfAverages.vw_all.map((v) => Number(v.toFixed(4))),
+      ...averages.vw_all.map((v) => Number(v.toFixed(4))),
+      null,
+    ],
+    [
+      'Volume-Weighted Avg (Latest 7)',
+      ...averages.vw_7.map((v) => Number(v.toFixed(4))),
       null,
     ],
     [
       'Volume-Weighted Avg (Latest 5)',
-      ...evaluation.ldfAverages.vw_5.map((v) => Number(v.toFixed(4))),
+      ...averages.vw_5.map((v) => Number(v.toFixed(4))),
       null,
     ],
     [
       'Volume-Weighted Avg (Latest 3)',
-      ...evaluation.ldfAverages.vw_3.map((v) => Number(v.toFixed(4))),
+      ...averages.vw_3.map((v) => Number(v.toFixed(4))),
       null,
     ],
     [
       'Simple Avg (All)',
-      ...evaluation.ldfAverages.simple_all.map((v) => Number(v.toFixed(4))),
+      ...averages.simple_all.map((v) => Number(v.toFixed(4))),
       null,
     ],
     [
       'Medial Avg (Excl. High/Low)',
-      ...evaluation.ldfAverages.medial.map((v) => Number(v.toFixed(4))),
+      ...averages.medial.map((v) => Number(v.toFixed(4))),
+      null,
+    ],
+    [
+      'Geometric Avg (All)',
+      ...averages.geometric.map((v) => Number(v.toFixed(4))),
       null,
     ],
     [
@@ -135,75 +150,76 @@ export function buildActuarialValuationWorkbook(
   XLSX.utils.book_append_sheet(wb, ws1, '01_Triangle_And_LDFs');
 
   // ==========================================================================
-  // Sheet 2: 02_Method_Comparison (CL / BF / CC)
+  // Sheet 2: 02_Method_Comparison (Full Method Suite)
   // ==========================================================================
   const sheet2AoA: (string | number | null)[][] = [
-    [`Actuarial Method Comparison (CL / BF / CC) — ${datasetName}`],
+    [`Method Comparison (CL / BF / CC / Benktander / ELR / Freq×Sev) — ${datasetName}`],
     [],
     [
       'Origin Period',
-      'Latest Cumulative',
-      'Earned Premium / Exposure',
-      'A Priori ELR',
+      'Latest Paid',
+      'Case Reserve (OS)',
+      'Earned Premium',
       'CDF to Ultimate',
       'Implied Maturity %',
       'CL IBNR',
-      'CL Ultimate',
       'BF IBNR',
-      'BF Ultimate',
-      'Cape Cod ELR',
-      'CC IBNR',
-      'CC Ultimate',
+      'Cape Cod IBNR',
+      'Benktander IBNR',
+      'ELR IBNR',
+      'Freq×Sev IBNR',
       'Selected Method',
       'Selected IBNR',
+      'Total Unpaid Reserve (OS+IBNR)',
+      'Discounted PV Reserve',
       'Selected Ultimate',
       'Ultimate Loss Ratio',
-      'Mack SE',
-      'Mack CV',
+      'Mack Ultimate SE',
+      'Merz-Wuthrich 1Yr CDR SE',
     ],
-    ...evaluation.rows.map((r, i) => [
-      originLabels[i] ?? `${r.originYear}`,
+    ...rows.map((r, i) => [
+      originLabels[i] ?? String(r.originYear),
       Number(r.latestCumulative.toFixed(2)),
+      Number(r.caseReserveOs.toFixed(2)),
       Number(r.earnedPremium.toFixed(2)),
-      Number(r.aprioriElr.toFixed(4)),
       Number(r.cdfToUltimate.toFixed(4)),
       Number(r.percentDeveloped.toFixed(4)),
       Number(r.clIbnr.toFixed(2)),
-      Number(r.clUltimate.toFixed(2)),
       Number(r.bfIbnr.toFixed(2)),
-      Number(r.bfUltimate.toFixed(2)),
-      Number(evaluation.capeCodElr.toFixed(4)),
       Number(r.ccIbnr.toFixed(2)),
-      Number(r.ccUltimate.toFixed(2)),
+      Number(r.bkIbnr.toFixed(2)),
+      Number(r.elrIbnr.toFixed(2)),
+      Number(r.freqSevIbnr.toFixed(2)),
       r.selectedMethod,
       Number(r.selectedIbnr.toFixed(2)),
+      Number(r.totalUnpaidReserve.toFixed(2)),
+      Number(r.discountedIbnr.toFixed(2)),
       Number(r.selectedUltimate.toFixed(2)),
       Number(r.ultimateLossRatio.toFixed(4)),
       Number(r.mackSe.toFixed(2)),
-      r.mackCv !== null ? Number(r.mackCv.toFixed(4)) : null,
+      Number(r.merzWuthrich1YrSe.toFixed(2)),
     ]),
     [
       'TOTAL PORTFOLIO',
       Number(evaluation.totals.latestCumulative.toFixed(2)),
+      Number(evaluation.totals.caseReserveOs.toFixed(2)),
       Number(evaluation.totals.earnedPremium.toFixed(2)),
       null,
       null,
-      null,
       Number(evaluation.totals.clIbnr.toFixed(2)),
-      Number(evaluation.totals.clUltimate.toFixed(2)),
       Number(evaluation.totals.bfIbnr.toFixed(2)),
-      Number(evaluation.totals.bfUltimate.toFixed(2)),
-      Number(evaluation.capeCodElr.toFixed(4)),
       Number(evaluation.totals.ccIbnr.toFixed(2)),
-      Number(evaluation.totals.ccUltimate.toFixed(2)),
+      Number(evaluation.totals.bkIbnr.toFixed(2)),
+      Number(evaluation.totals.elrIbnr.toFixed(2)),
+      Number(evaluation.totals.freqSevIbnr.toFixed(2)),
       'PORTFOLIO',
       Number(evaluation.totals.selectedIbnr.toFixed(2)),
+      Number(evaluation.totals.totalUnpaidReserve.toFixed(2)),
+      Number(evaluation.totals.discountedIbnr.toFixed(2)),
       Number(evaluation.totals.selectedUltimate.toFixed(2)),
       Number(evaluation.totals.ultimateLossRatio.toFixed(4)),
       Number(evaluation.totals.mackTotalSe.toFixed(2)),
-      evaluation.totals.mackTotalCv !== null
-        ? Number(evaluation.totals.mackTotalCv.toFixed(4))
-        : null,
+      Number(evaluation.totals.merzWuthrichTotal1YrSe.toFixed(2)),
     ],
   ];
 
@@ -393,7 +409,8 @@ export function buildActuarialValuationWorkbook(
  * Trigger browser download of the 5-sheet Actuarial & PYD Excel Workbook (.xlsx)
  */
 export function exportActuarialValuationWorkbookXlsx(
-  params: ActuarialWorkbookExportParams
+  params: ActuarialWorkbookExportParams,
+  filenamePrefix = 'Actuarial_Valuation_Workbook'
 ): void {
   const wb = buildActuarialValuationWorkbook(params);
   const outBuf = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
@@ -403,12 +420,13 @@ export function exportActuarialValuationWorkbookXlsx(
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = `AuraReserve_Valuation_Workbook_${new Date()
+  a.download = `${filenamePrefix}_${new Date()
     .toISOString()
     .slice(0, 10)}.xlsx`;
   a.click();
   URL.revokeObjectURL(url);
 }
+
 
 /**
  * Build a normalized, cleaned, and separate-premium-joined dataset workbook (.xlsx)
@@ -614,3 +632,4 @@ export function exportNormalizedFactDatasetCsv(
   a.click();
   URL.revokeObjectURL(url);
 }
+

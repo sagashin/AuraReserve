@@ -14,11 +14,13 @@ import {
   SeparatePremiumInspectResult,
   decodeFileBuffer,
   readExcelSheetsFromBuffer,
+  detectBestHeaderRowIndex,
   parseTextToRawGrid,
   inspectUniversalLossGrid,
   ingestUniversalLossGrid,
   inspectSeparatePremiumGrid,
   joinSeparatePremiumExposureDataset,
+  extractDirectTriangleFromGrid,
   generateWidePivotLossAndSeparatePremiumSample,
   generateWarekiMultiMetricAndEdgeCaseSample,
 } from '@/lib/universal-data-parser';
@@ -35,12 +37,13 @@ import {
   FileSpreadsheet,
   Activity,
   Download,
+  Grid3X3,
 } from 'lucide-react';
 import { exportNormalizedFactDatasetXlsx } from '@/lib/workbook-export';
 
 interface CsvSchemaMapperModalProps {
   isOpen: boolean;
-  initialMode?: 'loss' | 'separate_premium';
+  initialMode?: 'loss' | 'separate_premium' | 'direct_triangle';
   existingRecords: MultiSegmentFactRecord[];
   onClose: () => void;
   onIngestMappedDataset: (payload: {
@@ -53,6 +56,15 @@ interface CsvSchemaMapperModalProps {
     updatedRecords: MultiSegmentFactRecord[];
     summaryText: string;
   }) => void;
+  onApplyDirectTriangle?: (payload: {
+    originLabels: string[];
+    devPeriods: number[];
+    triangle: (number | null)[][];
+    earnedPremium: number[];
+    exposureCount: number[];
+    aprioriElr: number;
+    label: string;
+  }) => void;
 }
 
 export default function CsvSchemaMapperModal({
@@ -62,9 +74,10 @@ export default function CsvSchemaMapperModal({
   onClose,
   onIngestMappedDataset,
   onJoinSeparatePremiumDataset,
+  onApplyDirectTriangle,
 }: CsvSchemaMapperModalProps) {
   const [activeStudioTab, setActiveStudioTab] = useState<
-    'loss' | 'separate_premium'
+    'loss' | 'separate_premium' | 'direct_triangle'
   >(initialMode);
 
   // Loss Ingestion State
@@ -73,6 +86,9 @@ export default function CsvSchemaMapperModal({
     useState<string>('UTF-8 / Auto');
   const [excelSheetsMap, setExcelSheetsMap] = useState<
     Record<string, string[][]>
+  >({});
+  const [excelSuggestedHeaderMap, setExcelSuggestedHeaderMap] = useState<
+    Record<string, number>
   >({});
   const [excelSheetNames, setExcelSheetNames] = useState<string[]>([]);
   const [selectedLossSheet, setSelectedLossSheet] = useState<string>('');
@@ -93,6 +109,9 @@ export default function CsvSchemaMapperModal({
     useState<SeparatePremiumInspectResult | null>(null);
   const [selectedPremSheet, setSelectedPremSheet] = useState<string>('');
 
+  // Direct 2D Triangle Preview State
+  const [directUnitMult, setDirectUnitMult] = useState<number>(1);
+
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
 
@@ -112,19 +131,31 @@ export default function CsvSchemaMapperModal({
     }
   }, [lossConfig, lossGrid, headerRowIdx, valuationLabel]);
 
+  // Direct 2D Triangle Preview
+  const directTrianglePreview = useMemo(() => {
+    if (lossGrid.length === 0) return null;
+    try {
+      return extractDirectTriangleFromGrid(lossGrid, headerRowIdx, directUnitMult);
+    } catch {
+      return null;
+    }
+  }, [lossGrid, headerRowIdx, directUnitMult]);
+
   if (!isOpen) return null;
 
   const applyLossGrid = (
     grid: string[][],
-    hIdx = 0,
+    hIdx?: number,
     defaultValLabel = 'Custom-Dataset'
   ) => {
     setErrorMsg(null);
     setLossGrid(grid);
-    setHeaderRowIdx(hIdx);
+    const effectiveHIdx =
+      hIdx !== undefined ? hIdx : detectBestHeaderRowIndex(grid);
+    setHeaderRowIdx(effectiveHIdx);
     setValuationLabel(defaultValLabel);
     try {
-      const inspected = inspectUniversalLossGrid(grid, hIdx);
+      const inspected = inspectUniversalLossGrid(grid, effectiveHIdx);
       setLossConfig(inspected);
     } catch (err) {
       setErrorMsg(
@@ -133,12 +164,14 @@ export default function CsvSchemaMapperModal({
     }
   };
 
-  const applyPremiumGrid = (grid: string[][], hIdx = 0) => {
+  const applyPremiumGrid = (grid: string[][], hIdx?: number) => {
     setErrorMsg(null);
     setPremGrid(grid);
-    setPremHeaderRowIdx(hIdx);
+    const effectiveHIdx =
+      hIdx !== undefined ? hIdx : detectBestHeaderRowIndex(grid);
+    setPremHeaderRowIdx(effectiveHIdx);
     try {
-      const inspected = inspectSeparatePremiumGrid(grid, hIdx);
+      const inspected = inspectSeparatePremiumGrid(grid, effectiveHIdx);
       setPremConfig(inspected);
     } catch (err) {
       setErrorMsg(
@@ -162,17 +195,31 @@ export default function CsvSchemaMapperModal({
       const buf = reader.result as ArrayBuffer;
       if (isExcel) {
         try {
-          const { sheetNames, sheetsGridMap } = readExcelSheetsFromBuffer(buf);
+          const {
+            sheetNames,
+            sheetsGridMap,
+            suggestedHeaderRowMap,
+          } = readExcelSheetsFromBuffer(buf);
           setExcelSheetNames(sheetNames);
           setExcelSheetsMap(sheetsGridMap);
+          setExcelSuggestedHeaderMap(suggestedHeaderRowMap);
           setDetectedEncodingBadge('Excel Workbook (.xlsx)');
           if (sheetNames.length > 0) {
-            setSelectedLossSheet(sheetNames[0]);
-            applyLossGrid(sheetsGridMap[sheetNames[0]], 0, cleanName);
+            const s0 = sheetNames[0];
+            setSelectedLossSheet(s0);
+            const h0 = suggestedHeaderRowMap[s0] ?? 0;
+            applyLossGrid(sheetsGridMap[s0], h0, cleanName);
+            setStatusMsg(
+              `Excelブック「${file.name}」(${sheetNames.length}シート) を読み込み、Row ${
+                h0 + 1
+              } をヘッダー行として自動検出しました。`
+            );
           }
           if (sheetNames.length > 1) {
-            setSelectedPremSheet(sheetNames[1]);
-            applyPremiumGrid(sheetsGridMap[sheetNames[1]], 0);
+            const s1 = sheetNames[1];
+            setSelectedPremSheet(s1);
+            const h1 = suggestedHeaderRowMap[s1] ?? 0;
+            applyPremiumGrid(sheetsGridMap[s1], h1);
           }
         } catch (err) {
           setErrorMsg(
@@ -185,6 +232,11 @@ export default function CsvSchemaMapperModal({
         setRawLossText(decoded.text);
         const parsed = parseTextToRawGrid(decoded.text);
         applyLossGrid(parsed.grid, parsed.suggestedHeaderRowIndex, cleanName);
+        setStatusMsg(
+          `ファイル「${file.name}」を読み込み、Row ${
+            parsed.suggestedHeaderRowIndex + 1
+          } をヘッダー行として自動検出しました。`
+        );
       }
     };
     reader.readAsArrayBuffer(file);
@@ -203,12 +255,21 @@ export default function CsvSchemaMapperModal({
       const buf = reader.result as ArrayBuffer;
       if (isExcel) {
         try {
-          const { sheetNames, sheetsGridMap } = readExcelSheetsFromBuffer(buf);
+          const {
+            sheetNames,
+            sheetsGridMap,
+            suggestedHeaderRowMap,
+          } = readExcelSheetsFromBuffer(buf);
           setExcelSheetNames(sheetNames);
           setExcelSheetsMap(sheetsGridMap);
+          setExcelSuggestedHeaderMap(suggestedHeaderRowMap);
           if (sheetNames.length > 0) {
-            setSelectedPremSheet(sheetNames[0]);
-            applyPremiumGrid(sheetsGridMap[sheetNames[0]], 0);
+            const s0 = sheetNames[0];
+            setSelectedPremSheet(s0);
+            applyPremiumGrid(
+              sheetsGridMap[s0],
+              suggestedHeaderRowMap[s0] ?? 0
+            );
           }
         } catch (err) {
           setErrorMsg(
@@ -265,7 +326,7 @@ export default function CsvSchemaMapperModal({
     setRawPremText(thousandYenSeparatePremCsv);
     const parsedPrem = parseTextToRawGrid(thousandYenSeparatePremCsv);
     const inspectedPrem = inspectSeparatePremiumGrid(parsedPrem.grid, 0);
-    inspectedPrem.unitMultiplier = 1000; // 千円表記の別ファイル保険料を×1,000で円単位へ自動補正
+    inspectedPrem.unitMultiplier = 1000;
     setPremGrid(parsedPrem.grid);
     setPremHeaderRowIdx(0);
     setPremConfig(inspectedPrem);
@@ -283,6 +344,19 @@ export default function CsvSchemaMapperModal({
       segmentCols: exists
         ? lossConfig.segmentCols.filter((c) => c !== colName)
         : [...lossConfig.segmentCols, colName],
+    });
+  };
+
+  const toggleWideValueCol = (colName: string) => {
+    if (!lossConfig) return;
+    const exists = lossConfig.wideValueCols.includes(colName);
+    const nextWide = exists
+      ? lossConfig.wideValueCols.filter((c) => c !== colName)
+      : [...lossConfig.wideValueCols, colName];
+    setLossConfig({
+      ...lossConfig,
+      wideValueCols: nextWide,
+      segmentCols: lossConfig.segmentCols.filter((c) => !nextWide.includes(c)),
     });
   };
 
@@ -330,12 +404,63 @@ export default function CsvSchemaMapperModal({
         valuationLabel,
         availableGranularities: res.availableGranularities,
       });
+
+      // Also apply as direct triangle if only 1 segment was imported so the main Triangle Workspace updates immediately
+      if (onApplyDirectTriangle && directTrianglePreview && res.detectedSegmentsCount <= 1) {
+        onApplyDirectTriangle({
+          ...directTrianglePreview,
+          label: valuationLabel,
+        });
+      }
+
       onClose();
     } catch (err) {
+      // Fallback: if multi-segment ingestion failed because it's a simple 2D triangle, try direct 2D triangle extraction!
+      if (directTrianglePreview && onApplyDirectTriangle) {
+        onApplyDirectTriangle({
+          ...directTrianglePreview,
+          label: valuationLabel,
+        });
+        onClose();
+        return;
+      }
       setErrorMsg(
         err instanceof Error ? err.message : 'Failed to ingest dataset.'
       );
     }
+  };
+
+  const handleExecuteDirectTriangleOnly = () => {
+    if (!directTrianglePreview) {
+      setErrorMsg('有効な2Dトライアングル行列が検出できませんでした。ヘッダー行（Row）を確認してください。');
+      return;
+    }
+    if (onApplyDirectTriangle) {
+      onApplyDirectTriangle({
+        ...directTrianglePreview,
+        label: valuationLabel,
+      });
+    }
+    // Also try to ingest into MultiSegmentFactRecord store if possible so Segment/PYD view stays synced
+    if (lossConfig) {
+      try {
+        const res = ingestUniversalLossGrid(
+          lossGrid,
+          headerRowIdx,
+          { ...lossConfig, detectedShape: 'wide_pivot' },
+          valuationLabel
+        );
+        onIngestMappedDataset({
+          records: res.records,
+          summaryText: `Direct 2D Triangle Matrix (${directTrianglePreview.originLabels.length}×${directTrianglePreview.devPeriods.length})`,
+          valuationLabel,
+          availableGranularities: res.availableGranularities,
+        });
+      } catch {
+        // Direct triangle already applied to main workspace
+      }
+    }
+    onClose();
   };
 
   const handleExecuteSeparatePremiumJoinOnly = () => {
@@ -378,10 +503,10 @@ export default function CsvSchemaMapperModal({
               className="text-base font-bold text-slate-900 dark:text-slate-100 flex items-center gap-2"
             >
               <SlidersHorizontal className="w-4 h-4 text-sky-500" />
-              Universal Data Ingestion & Separate Premium/Exposure Join Studio
+              Universal Data Ingestion & Direct Triangle Studio
             </h2>
             <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-              縦持ち・横持ちピボット・個別クレーム明細・別ファイル保険料結合・Excel(.xlsx)複数シート・Shift-JIS・カンマ付き数値に完全対応
+              会社のExcel(.xlsx/.xls)・CSV・TSVコピペ・タイトル行付きシート・和暦(R5/H30/令和)・縦持ち/横持ちピボット/単一2Dトライアングルに完全対応
             </p>
           </div>
           <button
@@ -394,13 +519,13 @@ export default function CsvSchemaMapperModal({
           </button>
         </div>
 
-        {/* Studio Mode Tabs: Step 1 (Loss Data) vs Step 2 (Separate Premium/Exposure Data) */}
+        {/* Studio Mode Tabs */}
         <div className="px-6 pt-3 border-b border-slate-200 dark:border-slate-800 bg-slate-100/70 dark:bg-slate-900 flex flex-wrap items-center justify-between gap-3">
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <button
               type="button"
               onClick={() => setActiveStudioTab('loss')}
-              className={`px-4 py-2 text-xs font-semibold rounded-t-lg border-b-2 transition-colors cursor-pointer flex items-center gap-1.5 ${
+              className={`px-3.5 py-2 text-xs font-semibold rounded-t-lg border-b-2 transition-colors cursor-pointer flex items-center gap-1.5 ${
                 activeStudioTab === 'loss'
                   ? 'border-sky-500 bg-white dark:bg-slate-950 text-sky-700 dark:text-sky-300'
                   : 'border-transparent text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
@@ -412,15 +537,33 @@ export default function CsvSchemaMapperModal({
 
             <button
               type="button"
+              onClick={() => setActiveStudioTab('direct_triangle')}
+              className={`px-3.5 py-2 text-xs font-semibold rounded-t-lg border-b-2 transition-colors cursor-pointer flex items-center gap-1.5 ${
+                activeStudioTab === 'direct_triangle'
+                  ? 'border-sky-500 bg-white dark:bg-slate-950 text-sky-700 dark:text-sky-300'
+                  : 'border-transparent text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+              }`}
+            >
+              <Grid3X3 className="w-3.5 h-3.5" />
+              ② 単一2Dトライアングル直接取込 (Direct Matrix)
+              {directTrianglePreview && (
+                <span className="ml-1 px-1.5 py-0.5 text-[10px] rounded bg-sky-500/20 text-sky-600 dark:text-sky-300 font-mono">
+                  {directTrianglePreview.originLabels.length}×{directTrianglePreview.devPeriods.length}
+                </span>
+              )}
+            </button>
+
+            <button
+              type="button"
               onClick={() => setActiveStudioTab('separate_premium')}
-              className={`px-4 py-2 text-xs font-semibold rounded-t-lg border-b-2 transition-colors cursor-pointer flex items-center gap-1.5 ${
+              className={`px-3.5 py-2 text-xs font-semibold rounded-t-lg border-b-2 transition-colors cursor-pointer flex items-center gap-1.5 ${
                 activeStudioTab === 'separate_premium'
                   ? 'border-sky-500 bg-white dark:bg-slate-950 text-sky-700 dark:text-sky-300'
                   : 'border-transparent text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
               }`}
             >
               <Link2 className="w-3.5 h-3.5" />
-              ② 別ファイル・別シートの保険料／契約件数データを結合 (Separate Premium / Exposure)
+              ③ 別ファイル・別シートの保険料／契約件数結合
               {premConfig && (
                 <span className="ml-1 px-1.5 py-0.5 text-[10px] rounded bg-emerald-500/20 text-emerald-600 dark:text-emerald-300 font-mono">
                   Ready
@@ -458,8 +601,8 @@ export default function CsvSchemaMapperModal({
             <div className="flex items-center gap-2.5 text-xs text-emerald-950 dark:text-emerald-200">
               <ShieldCheck className="w-4 h-4 text-emerald-600 dark:text-emerald-400 shrink-0" />
               <span>
-                <strong>100% ブラウザ内メモリ処理（外部送信ゼロ）:</strong>{' '}
-                Excelブック(.xlsx)・Shift-JIS CSV・別ファイルの保険料データもすべてブラウザ内のみで安全に突合されます。
+                <strong>100% ローカル処理＆ヘッダー行自動検出 (Row 1〜30):</strong>{' '}
+                Excelブックの上部にタイトルや空白行があっても自動でヘッダー行を特定します。
               </span>
             </div>
 
@@ -507,7 +650,7 @@ export default function CsvSchemaMapperModal({
                 <div className="flex flex-wrap items-center gap-3">
                   <label className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold rounded-lg bg-sky-600 hover:bg-sky-500 text-white cursor-pointer transition-colors">
                     <Upload className="w-3.5 h-3.5" />
-                    Select Loss CSV / TSV / Excel (.xlsx)
+                    Select Loss CSV / TSV / Excel (.xlsx / .xls)
                     <input
                       type="file"
                       accept=".csv,.tsv,.txt,.xlsx,.xls"
@@ -527,7 +670,10 @@ export default function CsvSchemaMapperModal({
                           const s = e.target.value;
                           setSelectedLossSheet(s);
                           if (excelSheetsMap[s]) {
-                            applyLossGrid(excelSheetsMap[s], 0, s);
+                            const suggestedH =
+                              excelSuggestedHeaderMap[s] ??
+                              detectBestHeaderRowIndex(excelSheetsMap[s]);
+                            applyLossGrid(excelSheetsMap[s], suggestedH, s);
                           }
                         }}
                         className="px-2 py-1.5 rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800"
@@ -558,9 +704,14 @@ export default function CsvSchemaMapperModal({
                         }
                         className="font-mono px-2 py-1.5 rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800"
                       >
-                        {lossGrid.slice(0, 8).map((row, idx) => (
+                        {lossGrid.slice(0, 30).map((row, idx) => (
                           <option key={idx} value={idx}>
-                            Row {idx + 1}: {row.slice(0, 3).join(', ').slice(0, 32)}
+                            Row {idx + 1}:{' '}
+                            {row
+                              .filter((c) => c.trim() !== '')
+                              .slice(0, 4)
+                              .join(', ')
+                              .slice(0, 38) || '(空行)'}
                           </option>
                         ))}
                       </select>
@@ -616,12 +767,24 @@ export default function CsvSchemaMapperModal({
                       <select
                         aria-label="Loss Data Shape Mode"
                         value={lossConfig.detectedShape}
-                        onChange={(e) =>
+                        onChange={(e) => {
+                          const nextShape = e.target.value as LossDataShapeMode;
+                          let nextWide = lossConfig.wideValueCols;
+                          if (nextShape === 'wide_pivot' && nextWide.length === 0) {
+                            nextWide = lossConfig.headers.filter(
+                              (h) =>
+                                h !== lossConfig.originCol &&
+                                h !== lossConfig.metricTypeCol &&
+                                h !== lossConfig.premiumCol &&
+                                !lossConfig.segmentCols.includes(h)
+                            );
+                          }
                           setLossConfig({
                             ...lossConfig,
-                            detectedShape: e.target.value as LossDataShapeMode,
-                          })
-                        }
+                            detectedShape: nextShape,
+                            wideValueCols: nextWide,
+                          });
+                        }}
                         className="w-full text-xs px-2.5 py-2 rounded border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800"
                       >
                         <option value="long">
@@ -746,7 +909,7 @@ export default function CsvSchemaMapperModal({
                         <div className="lg:col-span-2">
                           <div className="flex items-center justify-between mb-1">
                             <label className="text-xs font-semibold text-slate-700 dark:text-slate-300">
-                              3. 横持ち展開されている進展月数 / 評価年月列 (自動アンピボット対象):
+                              3. 横持ち展開する進展月数 / 評価年月列 (クリックでON/OFF切替可):
                             </label>
                             <select
                               value={lossConfig.lossType}
@@ -764,15 +927,26 @@ export default function CsvSchemaMapperModal({
                               <option value="incremental">期間増分マトリクス</option>
                             </select>
                           </div>
-                          <div className="flex flex-wrap gap-1.5 p-2 rounded border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950/60">
-                            {lossConfig.wideValueCols.map((wc) => (
-                              <span
-                                key={wc}
-                                className="px-2 py-0.5 text-[11px] font-mono rounded bg-sky-500/20 text-sky-700 dark:text-sky-300"
-                              >
-                                {wc}
-                              </span>
-                            ))}
+                          <div className="flex flex-wrap gap-1.5 p-2 rounded border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950/60 max-h-24 overflow-y-auto">
+                            {lossConfig.headers
+                              .filter((h) => h !== lossConfig.originCol)
+                              .map((wc) => {
+                                const active = lossConfig.wideValueCols.includes(wc);
+                                return (
+                                  <button
+                                    key={wc}
+                                    type="button"
+                                    onClick={() => toggleWideValueCol(wc)}
+                                    className={`px-2 py-0.5 text-[11px] font-mono rounded border transition-colors cursor-pointer flex items-center gap-1 ${
+                                      active
+                                        ? 'border-sky-500 bg-sky-500/20 text-sky-700 dark:text-sky-300 font-semibold'
+                                        : 'border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-500'
+                                    }`}
+                                  >
+                                    {active ? '✓' : '+'} {wc}
+                                  </button>
+                                );
+                              })}
                           </div>
                         </div>
 
@@ -832,7 +1006,7 @@ export default function CsvSchemaMapperModal({
                       </>
                     )}
 
-                    {/* Multi-Metric Optional Columns (Incurred, Case Reserve, Claim Count, Exposure) */}
+                    {/* Multi-Metric Optional Columns */}
                     {lossConfig.detectedShape !== 'wide_pivot' && (
                       <>
                         <div>
@@ -921,7 +1095,7 @@ export default function CsvSchemaMapperModal({
                         className="w-full text-xs px-2.5 py-2 rounded border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800"
                       >
                         <option value="">
-                          (別データ結合 または 自動初期値)
+                          (別データ結合 または 損害規模から自動推計)
                         </option>
                         {lossConfig.headers.map((h) => (
                           <option key={h} value={h}>
@@ -1045,7 +1219,7 @@ export default function CsvSchemaMapperModal({
                   {/* Arbitrary Segment Checkboxes */}
                   <div className="p-3.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/60 dark:bg-slate-950/50">
                     <div className="text-xs font-semibold text-slate-900 dark:text-slate-100 mb-2">
-                      セグメント軸として使用する列を選択（列数・列名無制限）:
+                      セグメント軸として使用する列を選択（単一トライアングルの場合は全OFFでもOK）:
                     </div>
                     <div className="flex flex-wrap gap-2">
                       {lossConfig.headers.map((h) => {
@@ -1077,7 +1251,7 @@ export default function CsvSchemaMapperModal({
                   <div className="rounded-lg border border-slate-200 dark:border-slate-800 overflow-hidden">
                     <div className="px-4 py-2 bg-slate-100 dark:bg-slate-800/70 text-xs font-semibold text-slate-700 dark:text-slate-300 flex items-center gap-1.5">
                       <Table className="w-3.5 h-3.5 text-sky-500" />
-                      Loss Data Preview (先頭5行プレビュー)
+                      Loss Data Preview (Row {headerRowIdx + 1} ヘッダー基準・先頭5行プレビュー)
                     </div>
                     <div className="overflow-x-auto">
                       <table className="w-full border-collapse text-xs">
@@ -1116,7 +1290,157 @@ export default function CsvSchemaMapperModal({
           )}
 
           {/* ================================================================= */}
-          {/* TAB 2: SEPARATE PREMIUM / EXPOSURE DATASET RELATIONAL JOIN        */}
+          {/* TAB 2: DIRECT 2D TRIANGLE MATRIX MODE (Single Triangle)           */}
+          {/* ================================================================= */}
+          {activeStudioTab === 'direct_triangle' && (
+            <div className="space-y-4">
+              <div className="p-4 rounded-lg border border-sky-500/30 bg-sky-50/40 dark:bg-sky-950/20 text-xs text-slate-700 dark:text-slate-300 leading-relaxed">
+                <strong className="font-semibold text-slate-900 dark:text-white">
+                  単一2Dトライアングル直接取込モード (Direct Matrix):
+                </strong>{' '}
+                セグメント列や保険料列がないシンプルな2次元トライアングル表（Excelシートまたはコピー＆ペースト）を、列マッピング設定なしでそのままメイン画面のトライアングルへ直接取り込みます。
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between gap-3 p-4 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/60 dark:bg-slate-950/40">
+                <div className="flex flex-wrap items-center gap-3">
+                  <label className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold rounded-lg bg-sky-600 hover:bg-sky-500 text-white cursor-pointer transition-colors">
+                    <Upload className="w-3.5 h-3.5" />
+                    Select Triangle Excel (.xlsx) / CSV / TSV
+                    <input
+                      type="file"
+                      accept=".csv,.tsv,.txt,.xlsx,.xls"
+                      onChange={handleLossFileUpload}
+                      className="hidden"
+                    />
+                  </label>
+
+                  {lossGrid.length > 1 && (
+                    <div className="flex items-center gap-1.5 text-xs">
+                      <span className="font-medium text-slate-600 dark:text-slate-400">
+                        Header Row:
+                      </span>
+                      <select
+                        value={headerRowIdx}
+                        onChange={(e) =>
+                          applyLossGrid(
+                            lossGrid,
+                            Number(e.target.value),
+                            valuationLabel
+                          )
+                        }
+                        className="font-mono px-2 py-1.5 rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800"
+                      >
+                        {lossGrid.slice(0, 30).map((row, idx) => (
+                          <option key={idx} value={idx}>
+                            Row {idx + 1}:{' '}
+                            {row
+                              .filter((c) => c.trim() !== '')
+                              .slice(0, 4)
+                              .join(', ')
+                              .slice(0, 38) || '(空行)'}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  )}
+
+                  <div className="flex items-center gap-1.5 text-xs">
+                    <span className="font-medium text-slate-600 dark:text-slate-400">
+                      Multiplier:
+                    </span>
+                    <select
+                      value={directUnitMult}
+                      onChange={(e) => setDirectUnitMult(Number(e.target.value))}
+                      className="font-mono px-2 py-1.5 rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800"
+                    >
+                      <option value={1}>×1</option>
+                      <option value={1000}>×1,000 (千円→円)</option>
+                      <option value={1000000}>×1,000,000 (百万円→円)</option>
+                    </select>
+                  </div>
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">
+                  Excelの2Dトライアングル範囲をここに直接貼り付け (Tab / CSV):
+                </label>
+                <textarea
+                  rows={4}
+                  placeholder={
+                    'Origin\t12\t24\t36\t48\n2020\t120,000\t210,000\t265,000\t290,000\n2021\t135,000\t232,000\t291,000\t-\n2022\t148,000\t254,000\t-\t-\n2023\t162,000\t-\t-\t-'
+                  }
+                  value={rawLossText}
+                  onChange={(e) => {
+                    const txt = e.target.value;
+                    setRawLossText(txt);
+                    if (txt.trim().includes('\n')) {
+                      const parsed = parseTextToRawGrid(txt);
+                      applyLossGrid(parsed.grid, parsed.suggestedHeaderRowIndex);
+                    }
+                  }}
+                  className="w-full p-2.5 text-xs font-mono rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-slate-100"
+                />
+              </div>
+
+              {directTrianglePreview && (
+                <div className="rounded-lg border border-emerald-500/40 bg-emerald-50/20 dark:bg-emerald-950/20 overflow-hidden">
+                  <div className="px-4 py-2 bg-emerald-500/10 text-xs font-semibold text-emerald-800 dark:text-emerald-300 flex items-center justify-between">
+                    <span>
+                      Direct 2D Triangle Matrix Preview ({directTrianglePreview.originLabels.length} Origins × {directTrianglePreview.devPeriods.length} Dev Periods)
+                    </span>
+                    <button
+                      type="button"
+                      onClick={handleExecuteDirectTriangleOnly}
+                      className="px-3 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold cursor-pointer"
+                    >
+                      この2Dトライアングルを今すぐ反映
+                    </button>
+                  </div>
+                  <div className="overflow-x-auto">
+                    <table className="w-full border-collapse text-xs font-mono tabular-nums">
+                      <thead>
+                        <tr className="border-b border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900 text-slate-500">
+                          <th className="py-1.5 px-3 text-left">Origin</th>
+                          {directTrianglePreview.devPeriods.map((d) => (
+                            <th key={d} className="py-1.5 px-3 text-right">
+                              Dev {d}
+                            </th>
+                          ))}
+                          <th className="py-1.5 px-3 text-right text-sky-600 dark:text-sky-400">
+                            Earned Prem (Auto/Col)
+                          </th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-200/60 dark:divide-slate-800/60">
+                        {directTrianglePreview.originLabels.map((lbl, rIdx) => (
+                          <tr key={lbl}>
+                            <td className="py-1.5 px-3 font-semibold text-slate-900 dark:text-slate-100">
+                              {lbl}
+                            </td>
+                            {directTrianglePreview.triangle[rIdx].map((v, cIdx) => (
+                              <td
+                                key={cIdx}
+                                className="py-1.5 px-3 text-right text-slate-700 dark:text-slate-300"
+                              >
+                                {v !== null ? v.toLocaleString() : '—'}
+                              </td>
+                            ))}
+                            <td className="py-1.5 px-3 text-right text-sky-700 dark:text-sky-300">
+                              {directTrianglePreview.earnedPremium[rIdx]?.toLocaleString()}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ================================================================= */}
+          {/* TAB 3: SEPARATE PREMIUM / EXPOSURE DATASET RELATIONAL JOIN        */}
           {/* ================================================================= */}
           {activeStudioTab === 'separate_premium' && (
             <div className="space-y-4">
@@ -1124,7 +1448,7 @@ export default function CsvSchemaMapperModal({
                 <strong className="font-semibold text-slate-900 dark:text-white">
                   別ファイル・別シートの保険料／契約件数（Exposure）スマート結合:
                 </strong>{' '}
-                損害データとは別管理になっている保険料・契約件数テーブル（縦持ち または 年度が列方向に並ぶ横持ち表）を読み込み、共通するセグメント列と期間（月次・四半期・暦年CY・4月会計年度FY）で自動突合します。保険料データのセグメント粒度が粗い場合でも、下位セグメントへ損害実績比で自動按分されます。
+                損害データとは別管理になっている保険料・契約件数テーブル（縦持ち または 年度が列方向に並ぶ横持ち表）を読み込み、共通するセグメント列と期間（月次・四半期・暦年CY・4月会計年度FY）で自動突合します。
               </div>
 
               <div className="flex flex-wrap items-center justify-between gap-3 p-4 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/60 dark:bg-slate-950/40">
@@ -1151,7 +1475,10 @@ export default function CsvSchemaMapperModal({
                           const s = e.target.value;
                           setSelectedPremSheet(s);
                           if (excelSheetsMap[s]) {
-                            applyPremiumGrid(excelSheetsMap[s], 0);
+                            const suggestedH =
+                              excelSuggestedHeaderMap[s] ??
+                              detectBestHeaderRowIndex(excelSheetsMap[s]);
+                            applyPremiumGrid(excelSheetsMap[s], suggestedH);
                           }
                         }}
                         className="px-2 py-1.5 rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800"
@@ -1159,6 +1486,32 @@ export default function CsvSchemaMapperModal({
                         {excelSheetNames.map((s) => (
                           <option key={s} value={s}>
                             {s}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  )}
+
+                  {premGrid.length > 1 && (
+                    <div className="flex items-center gap-1.5 text-xs">
+                      <span className="font-medium text-slate-600 dark:text-slate-400">
+                        Header Row:
+                      </span>
+                      <select
+                        value={premHeaderRowIdx}
+                        onChange={(e) =>
+                          applyPremiumGrid(premGrid, Number(e.target.value))
+                        }
+                        className="font-mono px-2 py-1.5 rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800"
+                      >
+                        {premGrid.slice(0, 30).map((row, idx) => (
+                          <option key={idx} value={idx}>
+                            Row {idx + 1}:{' '}
+                            {row
+                              .filter((c) => c.trim() !== '')
+                              .slice(0, 4)
+                              .join(', ')
+                              .slice(0, 38) || '(空行)'}
                           </option>
                         ))}
                       </select>
@@ -1327,6 +1680,16 @@ export default function CsvSchemaMapperModal({
               Cancel
             </button>
 
+            {activeStudioTab === 'direct_triangle' && directTrianglePreview && (
+              <button
+                type="button"
+                onClick={handleExecuteDirectTriangleOnly}
+                className="px-5 py-2 text-xs font-semibold rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white shadow-xs transition-colors cursor-pointer"
+              >
+                Apply Direct 2D Triangle Matrix (単一2Dトライアングルとして反映)
+              </button>
+            )}
+
             {activeStudioTab === 'separate_premium' && premConfig && !lossConfig && (
               <button
                 type="button"
@@ -1375,9 +1738,11 @@ export default function CsvSchemaMapperModal({
 
             <button
               type="button"
-              disabled={!lossConfig && !premConfig}
+              disabled={!lossConfig && !premConfig && !directTrianglePreview}
               onClick={() => {
-                if (lossConfig) {
+                if (activeStudioTab === 'direct_triangle' && directTrianglePreview) {
+                  handleExecuteDirectTriangleOnly();
+                } else if (lossConfig) {
                   handleExecuteLossIngest(true);
                 } else if (premConfig) {
                   handleExecuteSeparatePremiumJoinOnly();

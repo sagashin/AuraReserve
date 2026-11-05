@@ -1,11 +1,19 @@
 'use client';
 
-import React from 'react';
+import React, { useState, useMemo } from 'react';
 import {
   PriorYearDevelopmentAnalysis,
   PydConfiguration,
   SegmentFilterState,
+  MultiSegmentFactRecord,
+  TimeGranularity,
+  buildDefaultMultiSegmentFactStore,
+  getAvailableSegmentDimensions,
+  pivotSegmentTriangle,
+  evaluatePortfolioPriorYearDevelopment,
 } from '@/lib/segment-pyd-engine';
+import { LdfAverageMode, ValuationMonthId } from '@/lib/actuarial-engine';
+import { DisplayUnitConfig } from '@/lib/format-utils';
 import {
   formatCurrency,
   formatNumber,
@@ -21,25 +29,148 @@ import {
 } from 'lucide-react';
 
 interface PriorYearDevAndSegmentsViewProps {
-  pydAnalysis: PriorYearDevelopmentAnalysis;
-  pydConfig: PydConfiguration;
-  onUpdatePydConfig: (nextConfig: PydConfiguration) => void;
-  activeFilters: SegmentFilterState;
-  currencySymbol: string;
-  onSelectSegmentSlice: (
+  pydAnalysis?: PriorYearDevelopmentAnalysis;
+  pydConfig?: PydConfiguration;
+  onUpdatePydConfig?: (nextConfig: PydConfiguration) => void;
+  activeFilters?: SegmentFilterState;
+  currencySymbol?: string;
+  onSelectSegmentSlice?: (
     filters: SegmentFilterState,
     openTriangleTab?: boolean
   ) => void;
+  // Self-contained workbench props
+  valuationMonth?: ValuationMonthId;
+  granularity?: TimeGranularity;
+  selectedMode?: LdfAverageMode;
+  tailFactor?: number;
+  customFactRecords?: MultiSegmentFactRecord[] | null;
+  unitConfig?: DisplayUnitConfig;
+  onOpenSchemaMapper?: (
+    mode?: 'loss' | 'separate_premium' | 'direct_triangle'
+  ) => void;
+  onLoadCustomRecords?: (
+    records: MultiSegmentFactRecord[],
+    summaryText: string
+  ) => void;
+  onResetToDefaultRecords?: () => void;
+  onValuationMonthChange?: (m: ValuationMonthId) => void;
+  onGranularityChange?: (g: TimeGranularity) => void;
+  onApplySegmentToTriangle?: (payload: {
+    label: string;
+    originLabels: string[];
+    devPeriods: number[];
+    triangle: (number | null)[][];
+    earnedPremium: number[];
+    aprioriElr: number;
+  }) => void;
 }
 
 export default function PriorYearDevAndSegmentsView({
-  pydAnalysis,
-  pydConfig,
-  onUpdatePydConfig,
-  activeFilters,
-  currencySymbol,
-  onSelectSegmentSlice,
+  pydAnalysis: propPydAnalysis,
+  pydConfig: propPydConfig,
+  onUpdatePydConfig: propOnUpdatePydConfig,
+  activeFilters: propActiveFilters,
+  currencySymbol: propCurrencySymbol,
+  onSelectSegmentSlice: propOnSelectSegmentSlice,
+  valuationMonth = '2026-10',
+  granularity = 'annual',
+  selectedMode = 'vw_all',
+  tailFactor = 1.01,
+  customFactRecords = null,
+  unitConfig,
+  onApplySegmentToTriangle,
 }: PriorYearDevAndSegmentsViewProps) {
+  const [internalPydConfig, setInternalPydConfig] = useState<PydConfiguration>(
+    {}
+  );
+  const [internalFilters, setInternalFilters] = useState<SegmentFilterState>({
+    product: 'ALL',
+    channel: 'ALL',
+    coverage: 'ALL',
+    region: 'ALL',
+  });
+
+  const pydConfig = propPydConfig ?? internalPydConfig;
+  const onUpdatePydConfig = propOnUpdatePydConfig ?? setInternalPydConfig;
+  const activeFilters = propActiveFilters ?? internalFilters;
+  const currencySymbol =
+    propCurrencySymbol ??
+    (unitConfig ? `${unitConfig.symbol}(${unitConfig.badge})` : '¥');
+
+  const activeRecords = useMemo(
+    () =>
+      customFactRecords && customFactRecords.length > 0
+        ? customFactRecords
+        : buildDefaultMultiSegmentFactStore(),
+    [customFactRecords]
+  );
+
+  const computedPydAnalysis = useMemo(() => {
+    if (propPydAnalysis) return propPydAnalysis;
+    const dims = getAvailableSegmentDimensions(activeRecords);
+    const valM = dims.valuationMonths.includes(valuationMonth)
+      ? valuationMonth
+      : dims.valuationMonths[dims.valuationMonths.length - 1] ?? '2026-10';
+    const gran = dims.granularities.includes(granularity)
+      ? granularity
+      : dims.granularities[0] ?? 'annual';
+    return evaluatePortfolioPriorYearDevelopment(
+      activeRecords,
+      valM,
+      gran,
+      activeFilters,
+      selectedMode,
+      tailFactor,
+      undefined,
+      pydConfig,
+      unitConfig?.divisor ?? 1
+    );
+  }, [
+    propPydAnalysis,
+    activeRecords,
+    valuationMonth,
+    granularity,
+    activeFilters,
+    selectedMode,
+    tailFactor,
+    pydConfig,
+    unitConfig?.divisor,
+  ]);
+
+  const onSelectSegmentSlice =
+    propOnSelectSegmentSlice ??
+    ((nextFilters: SegmentFilterState, openTriangleTab?: boolean) => {
+      setInternalFilters(nextFilters);
+      if (openTriangleTab && onApplySegmentToTriangle) {
+        const dims = getAvailableSegmentDimensions(activeRecords);
+        const valM = dims.valuationMonths.includes(valuationMonth)
+          ? valuationMonth
+          : dims.valuationMonths[dims.valuationMonths.length - 1] ?? '2026-10';
+        const gran = dims.granularities.includes(granularity)
+          ? granularity
+          : dims.granularities[0] ?? 'annual';
+        const slice = pivotSegmentTriangle(
+          activeRecords,
+          valM,
+          gran,
+          nextFilters
+        );
+        const filterLabel =
+          Object.values(nextFilters)
+            .filter((v) => v && v !== 'ALL')
+            .join(' · ') || 'Total Portfolio';
+        onApplySegmentToTriangle({
+          label: filterLabel,
+          originLabels: slice.originLabels,
+          devPeriods: slice.devPeriods,
+          triangle: slice.cumulativeTriangle,
+          earnedPremium: slice.earnedPremium,
+          aprioriElr: slice.aprioriElr[0] ?? 0.75,
+        });
+      }
+    });
+
+  const pydAnalysis = computedPydAnalysis;
   const {
     priorTotals,
     currentYear2026Totals,

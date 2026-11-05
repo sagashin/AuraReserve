@@ -65,29 +65,114 @@ export function decodeFileBuffer(
 }
 
 /**
+ * Automatically score and detect the true header row index (scanning up to Row 30)
+ * in corporate Excel sheets or CSV grids that have title blocks, metadata rows, or blank top rows.
+ */
+export function detectBestHeaderRowIndex(grid: string[][]): number {
+  if (!grid || grid.length === 0) return 0;
+  const maxScan = Math.min(grid.length, 30);
+  const maxCols = Math.max(1, ...grid.slice(0, maxScan).map((r) => r.filter((c) => c.trim() !== '').length));
+
+  let bestRow = 0;
+  let bestScore = -999;
+
+  const headerKeywordRegex =
+    /origin|accident|incurral|underwriting|policy|year|period|dev|lag|paid|incurred|loss|claim|premium|exposure|segment|line|product|channel|region|事故|発生|契約|年度|年月|進展|経過|支払|損害|備金|件数|保険料|種目|チャネル|地域|区分|\bay\b|\buy\b|\bpy\b|\bfy\b/i;
+
+  for (let r = 0; r < maxScan; r++) {
+    const row = grid[r] ?? [];
+    const nonEmpty = row.map((c) => c.trim()).filter((c) => c.length > 0);
+    if (nonEmpty.length < 2) continue;
+
+    let score = 0;
+    // Density of populated columns
+    if (nonEmpty.length >= Math.max(2, Math.floor(maxCols * 0.5))) {
+      score += nonEmpty.length * 2;
+    }
+
+    // Count actuarial / header keywords
+    let keywordMatches = 0;
+    let wideLagMatches = 0;
+    for (const cell of nonEmpty) {
+      if (headerKeywordRegex.test(cell)) {
+        keywordMatches++;
+      }
+      if (parseWideDevOrPeriodHeader(cell).isWideValueCol) {
+        wideLagMatches++;
+      }
+    }
+    score += keywordMatches * 8;
+    if (wideLagMatches >= 2) {
+      score += wideLagMatches * 6;
+    }
+
+    // Check if the next row (r + 1) looks like a data row (starts with a date/cohort or has numbers)
+    const nextRow = grid[r + 1];
+    if (nextRow) {
+      const nextNonEmpty = nextRow.map((c) => c.trim()).filter(Boolean);
+      const hasOriginInNextRow = nextNonEmpty.some((c) => parseFlexiblePeriodString(c) !== null);
+      const numCountInNextRow = nextNonEmpty.filter((c) => parseCleanActuarialNumber(c) !== null).length;
+      if (hasOriginInNextRow) score += 15;
+      if (numCountInNextRow >= 2) score += 10;
+
+      // Penalize if row `r` itself looks like a pure data row (first cell is a date like FY2019 and rest are large numbers > 360)
+      const firstCellDate = parseFlexiblePeriodString(row[0] ?? '');
+      const largeNumsInRow = nonEmpty
+        .slice(1)
+        .filter((c) => {
+          const n = parseCleanActuarialNumber(c);
+          return n !== null && (Math.abs(n) > 360 || c.includes(','));
+        }).length;
+      if (firstCellDate && largeNumsInRow >= 2 && keywordMatches === 0) {
+        score -= 25;
+      }
+    }
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestRow = r;
+    }
+  }
+
+  return bestRow;
+}
+
+/**
  * Read an Excel (.xlsx / .xls) workbook ArrayBuffer into a map of sheet names -> 2D string grids
+ * along with the auto-detected header row index per sheet.
  */
 export function readExcelSheetsFromBuffer(buffer: ArrayBuffer): {
   sheetNames: string[];
   sheetsGridMap: Record<string, string[][]>;
+  suggestedHeaderRowMap: Record<string, number>;
 } {
-  const workbook = XLSX.read(buffer, { type: 'array', raw: false });
+  const workbook = XLSX.read(buffer, { type: 'array', raw: false, cellDates: true });
   const sheetNames = workbook.SheetNames;
   const sheetsGridMap: Record<string, string[][]> = {};
+  const suggestedHeaderRowMap: Record<string, number> = {};
 
   for (const name of sheetNames) {
     const ws = workbook.Sheets[name];
-    const aoa = XLSX.utils.sheet_to_json<(string | number | null)[]>(ws, {
+    const aoa = XLSX.utils.sheet_to_json<(string | number | boolean | Date | null)[]>(ws, {
       header: 1,
       defval: '',
       blankrows: false,
+      raw: false,
     });
-    sheetsGridMap[name] = aoa.map((row) =>
-      row.map((cell) => (cell === null || cell === undefined ? '' : String(cell).trim()))
+    const grid = aoa.map((row) =>
+      row.map((cell) => {
+        if (cell === null || cell === undefined) return '';
+        if (cell instanceof Date) {
+          return cell.toISOString().slice(0, 10);
+        }
+        return String(cell).trim();
+      })
     );
+    sheetsGridMap[name] = grid;
+    suggestedHeaderRowMap[name] = detectBestHeaderRowIndex(grid);
   }
 
-  return { sheetNames, sheetsGridMap };
+  return { sheetNames, sheetsGridMap, suggestedHeaderRowMap };
 }
 
 /**
@@ -120,6 +205,7 @@ export function parseDelimitedLine(line: string, delimiter: string): string[] {
 
 /**
  * Parse raw CSV or Excel TSV text into a 2D string grid, automatically detecting delimiter (`,` vs `\t` vs `;`)
+ * and scanning up to Row 30 for the best header row.
  */
 export function parseTextToRawGrid(rawText: string): {
   grid: string[][];
@@ -136,31 +222,25 @@ export function parseTextToRawGrid(rawText: string): {
     return { grid: [], delimiter: ',', suggestedHeaderRowIndex: 0 };
   }
 
-  // Detect delimiter from the first few lines
-  const sampleLine = rawLines[Math.min(1, rawLines.length - 1)];
-  const tabCount = (sampleLine.match(/\t/g) ?? []).length;
-  const semiCount = (sampleLine.match(/;/g) ?? []).length;
-  const commaCount = (sampleLine.match(/,/g) ?? []).length;
+  // Detect delimiter across the first 10 lines
+  let tabScore = 0;
+  let semiScore = 0;
+  let commaScore = 0;
+  for (let i = 0; i < Math.min(rawLines.length, 10); i++) {
+    tabScore += (rawLines[i].match(/\t/g) ?? []).length;
+    semiScore += (rawLines[i].match(/;/g) ?? []).length;
+    commaScore += (rawLines[i].match(/,/g) ?? []).length;
+  }
 
   const delimiter: ',' | '\t' | ';' =
-    tabCount > commaCount && tabCount >= semiCount
+    tabScore > commaScore && tabScore >= semiScore
       ? '\t'
-      : semiCount > commaCount
+      : semiScore > commaScore
       ? ';'
       : ',';
 
   const grid = rawLines.map((line) => parseDelimitedLine(line, delimiter));
-
-  // Auto-detect header row index (skip single-cell title rows or metadata rows at top)
-  const maxCols = Math.max(...grid.slice(0, 10).map((r) => r.filter(Boolean).length));
-  let suggestedHeaderRowIndex = 0;
-  for (let r = 0; r < Math.min(grid.length, 8); r++) {
-    const nonEmptyCount = grid[r].filter((c) => c.length > 0).length;
-    if (nonEmptyCount >= Math.max(2, Math.floor(maxCols * 0.6))) {
-      suggestedHeaderRowIndex = r;
-      break;
-    }
-  }
+  const suggestedHeaderRowIndex = detectBestHeaderRowIndex(grid);
 
   return { grid, delimiter, suggestedHeaderRowIndex };
 }
@@ -213,7 +293,7 @@ export function parseCleanActuarialNumber(raw: string | number | null | undefine
 
 /**
  * Check if a column header represents a development lag or calendar period in a Wide Pivot table
- * e.g. '12', '12m', '24ヶ月', 'Dev12', 'Lag_1', '2020-01', '2022Q3', 'FY2021'
+ * e.g. '0', '1', '12', '12m', 'M12', '24ヶ月', 'Dev12', 'Lag_1', '第1期', '1年目', '経過1年', '0-12', '2020-01', '2022Q3', 'FY2021', 'R5'
  */
 export function parseWideDevOrPeriodHeader(header: string): {
   isWideValueCol: boolean;
@@ -221,23 +301,36 @@ export function parseWideDevOrPeriodHeader(header: string): {
   lagValue?: number;
   periodRaw?: string;
 } {
-  const h = header.trim();
+  const h = header
+    .trim()
+    .replace(/[０-９]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xfee0))
+    .replace(/[Ａ-Ｚａ-ｚ]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xfee0));
   if (!h) return { isWideValueCol: false, mode: 'lag' };
 
-  // Check pure lag header: "12", "12m", "24M", "36ヶ月", "12カ月", "Dev12", "Lag 24", "1年", "2年目"
+  // 0. Range lag header: "0-12", "12-24", "0〜12ヶ月" -> take upper bound
+  const rangeMatch = h.match(/^(\d{1,3})\s*[-~〜～]\s*(\d{1,3})\s*(?:m|mo|months?|ヶ月|カ月|か月)?$/i);
+  if (rangeMatch) {
+    const upper = Number(rangeMatch[2]);
+    if (upper >= 1 && upper <= 360) {
+      return { isWideValueCol: true, mode: 'lag', lagValue: upper };
+    }
+  }
+
+  // 1. Pure lag header: "0", "1", "12", "12m", "M12", "24M", "36ヶ月", "12カ月", "Dev 12", "Lag_24", "第1期", "1期", "進展12"
   const lagMatch = h.match(
-    /^(?:dev[\s_-]*|lag[\s_-]*|進展)?(\d{1,3})\s*(?:m|mo|months?|ヶ月|カ月|か月|期)?$/i
+    /^(?:dev[\s_:-]*|lag[\s_:-]*|development[\s_:-]*|m|進展|経過|第)?\s*(\d{1,3})\s*(?:m|mo|months?|ヶ月|カ月|か月|期|四半期)?$/i
   );
   if (lagMatch) {
     const val = Number(lagMatch[1]);
-    // Avoid treating 4-digit years like 2021 as lag
-    if (val >= 1 && val <= 360) {
+    // Avoid treating 4-digit years like 2021 as lag; allow 0..360
+    if (val >= 0 && val <= 360) {
       return { isWideValueCol: true, mode: 'lag', lagValue: val };
     }
   }
 
-  const yrLagMatch = h.match(/^(\d{1,2})\s*(?:yr|year|年|年目)$/i);
-  if (yrLagMatch) {
+  // 2. Year-based lag header: "1年", "2年目", "経過1年", "Year 1", "Yr 2", "Y1"
+  const yrLagMatch = h.match(/^(?:経過|進展|year|yr|y)?\s*(\d{1,2})\s*(?:yr|year|年|年目)?$/i);
+  if (yrLagMatch && /年|yr|year|^y\d/i.test(h)) {
     return {
       isWideValueCol: true,
       mode: 'lag',
@@ -245,11 +338,24 @@ export function parseWideDevOrPeriodHeader(header: string): {
     };
   }
 
-  // Check if header is a date/period like '2020-06', '2021Q2', 'FY2020', '2021'
+  // 3. Quarter-based lag header: "Q1", "Q2", "1Q", "2Q" (without 4-digit year)
+  const qLagMatch = h.match(/^(?:[Qq](\d{1,2})|(\d{1,2})[Qq])$/);
+  if (qLagMatch) {
+    const qNum = Number(qLagMatch[1] || qLagMatch[2]);
+    if (qNum >= 1 && qNum <= 40) {
+      return {
+        isWideValueCol: true,
+        mode: 'lag',
+        lagValue: qNum * 3,
+      };
+    }
+  }
+
+  // 4. Check if header is a date/period like '2020-06', '2021Q2', 'FY2020', '2021', '令和5年度', 'R5', 'H30'
   const periodInfo = parseFlexiblePeriodString(h);
   if (
     periodInfo &&
-    (/\d{4}/.test(h) || /令和|平成|昭和|[RrHhSs]\s*(?:元|\d)/.test(h))
+    (/\d{4}/.test(h) || /令和|平成|昭和|^[RrHhSs]\s*(?:元|\d)/i.test(h))
   ) {
     return {
       isWideValueCol: true,
@@ -297,9 +403,28 @@ export function inspectUniversalLossGrid(
     throw new Error('Selected header row index exceeds total rows in data.');
   }
 
-  const rawHeaders = grid[headerRowIndex];
-  const headers = rawHeaders.map((h, i) => h.trim() || `Column_${i + 1}`);
+  const rawHeaders = grid[headerRowIndex] ?? [];
+  const parentRow = headerRowIndex > 0 ? grid[headerRowIndex - 1] ?? [] : [];
   const dataRows = grid.slice(headerRowIndex + 1).filter((r) => r.some((c) => c.trim() !== ''));
+
+  const maxColLen = Math.max(
+    rawHeaders.length,
+    ...dataRows.slice(0, 10).map((r) => r.length)
+  );
+
+  // Build headers, inheriting from `headerRowIndex - 1` if a merged header cell in Excel left `rawHeaders[i]` blank
+  const usedNames = new Set<string>();
+  const headers: string[] = [];
+  for (let i = 0; i < maxColLen; i++) {
+    const primary = (rawHeaders[i] ?? '').trim();
+    const parent = (parentRow[i] ?? '').trim();
+    let candidate = primary || parent || `Column_${i + 1}`;
+    if (usedNames.has(candidate)) {
+      candidate = `${candidate}_${i + 1}`;
+    }
+    usedNames.add(candidate);
+    headers.push(candidate);
+  }
 
   const sampleRows: Record<string, string>[] = dataRows.slice(0, 5).map((r) => {
     const obj: Record<string, string> = {};
@@ -315,20 +440,59 @@ export function inspectUniversalLossGrid(
   const findHeader = (patterns: RegExp[]): string | undefined =>
     headers.find((h) => patterns.some((p) => p.test(h.toLowerCase())));
 
-  const originCol =
-    findHeader([
-      /origin|accident|incurral|loss_date|事故年月|事故年度|事故日|発生年月|発生年度|発生日|契約年度/,
-    ]) ?? headers[0];
+  // Detect origin column by header keyword OR by checking which column contains dates/cohorts in dataRows
+  let originCol = findHeader([
+    /origin|accident|incurral|underwriting|policy_year|loss_date|\bay\b|\buy\b|\bpy\b|事故年月|事故年度|事故日|発生年月|発生年度|発生日|契約年度|対象年度|年度/,
+  ]);
+  if (!originCol && dataRows.length > 0) {
+    for (let c = 0; c < Math.min(headers.length, 5); c++) {
+      if (wideCols.includes(headers[c])) continue;
+      const validDates = dataRows
+        .slice(0, 8)
+        .filter((r) => parseFlexiblePeriodString(r[c] ?? '') !== null).length;
+      if (validDates >= Math.min(2, dataRows.length)) {
+        originCol = headers[c];
+        break;
+      }
+    }
+  }
+  if (!originCol) {
+    originCol = headers[0];
+  }
 
   const claimIdCol = findHeader([/claim_id|claim_no|クレーム番号|事故番号|証券番号|明細番号/]);
+  const metricTypeCol = findHeader([/metric|item|指標区分|指標|項目区分|データ区分|種別/]);
+  const premiumCol = findHeader([/prem|earned|\bep\b|\bgwp\b|\bnwp\b|保険料|既経過|収入保険料/]);
+  const exposureCol = findHeader([/exposure|policy_count|契約件数|経過契約|台数|エクスポージャー/]);
+  const elrCol = findHeader([/elr|loss_ratio|apriori|損害率|予定損害率/]);
 
-  // If 3 or more columns match wide lag/period headers, classify as 'wide_pivot'
-  if (wideCols.length >= 3) {
+  // Also identify numeric columns in dataRows as fallback candidate wide columns if user switches to wide_pivot manually
+  const fallbackNumericCols = headers.filter((h, cIdx) => {
+    if (
+      h === originCol ||
+      h === metricTypeCol ||
+      h === premiumCol ||
+      h === exposureCol ||
+      h === elrCol ||
+      h === claimIdCol
+    ) {
+      return false;
+    }
+    const sampleCheck = dataRows.slice(0, 8);
+    if (sampleCheck.length === 0) return false;
+    const numericOrDash = sampleCheck.filter((r) => {
+      const cell = (r[cIdx] ?? '').trim();
+      return cell === '' || cell === '-' || cell === '—' || parseCleanActuarialNumber(cell) !== null;
+    }).length;
+    const hasAtLeastOneNum = sampleCheck.some((r) => parseCleanActuarialNumber(r[cIdx]) !== null);
+    return hasAtLeastOneNum && numericOrDash >= Math.ceil(sampleCheck.length * 0.7);
+  });
+
+  const candidateWideCols = wideCols.length >= 2 ? wideCols : fallbackNumericCols;
+
+  // If 2 or more columns match wide lag/period headers, classify as 'wide_pivot'
+  if (wideCols.length >= 2) {
     const firstWide = parseWideDevOrPeriodHeader(wideCols[0]);
-    const metricTypeCol = findHeader([/metric|item|指標区分|指標|項目区分|データ区分/]);
-    const premiumCol = findHeader([/prem|earned|\bep\b|保険料|既経過/]);
-    const exposureCol = findHeader([/exposure|契約件数|経過契約|台数/]);
-    const elrCol = findHeader([/elr|loss_ratio|損害率|予定損害率/]);
 
     const reserved = new Set<string>([
       originCol,
@@ -338,7 +502,7 @@ export function inspectUniversalLossGrid(
       ...(exposureCol ? [exposureCol] : []),
       ...(elrCol ? [elrCol] : []),
     ]);
-    const segmentCols = headers.filter((h) => !reserved.has(h));
+    const segmentCols = headers.filter((h) => !reserved.has(h) && !/^Column_\d+$/.test(h));
 
     return {
       headers,
@@ -363,9 +527,9 @@ export function inspectUniversalLossGrid(
   }
 
   // Otherwise Long or Claim Ledger
-  const lagCol = findHeader([/dev|lag|elapsed|進展|経過/]);
+  const lagCol = findHeader([/dev|lag|elapsed|進展|経過|月数|年数/]);
   const valPeriodCol = findHeader([
-    /valuation|calendar|accounting|eval|payment_date|paid_date|評価年月|支払年月|支払日|計上年月|会計年月|決済年月/,
+    /valuation|calendar|accounting|eval|payment_date|paid_date|評価年月|支払年月|支払日|計上年月|会計年月|決済年月|集計年月/,
   ]);
 
   const detectedShape: LossDataShapeMode =
@@ -381,14 +545,11 @@ export function inspectUniversalLossGrid(
 
   const incLossCol = findHeader([/incremental|期間損害|当期支払|単月支払|支払額/]);
   const cumLossCol = findHeader([
-    /cum|paid|loss|claim|amount|累積|支払損害|損害|支払|ロス/,
+    /cum|paid|loss|claim|amount|累積|支払損害|損害|支払|ロス|金額/,
   ]);
-  const incurredLossCol = findHeader([/incurred|発生損害|発生ロス/]);
-  const caseReserveCol = findHeader([/case|os_reserve|個別備金|個別支払備金|支払備金残高/]);
+  const incurredLossCol = findHeader([/incurred|発生損害|発生ロス|既発生/]);
+  const caseReserveCol = findHeader([/case|os_reserve|outstanding|個別備金|個別支払備金|支払備金残高/]);
   const claimCountCol = findHeader([/count|claims|件数|クレーム件数|事故件数/]);
-  const premiumCol = findHeader([/prem|earned|\bep\b|保険料|既経過/]);
-  const exposureCol = findHeader([/exposure|policy_count|契約件数|経過契約|台数/]);
-  const elrCol = findHeader([/elr|loss_ratio|apriori|損害率|予定損害率/]);
 
   const lossType: 'cumulative' | 'incremental' =
     detectedShape === 'claim_ledger' ||
@@ -416,7 +577,7 @@ export function inspectUniversalLossGrid(
     ].filter(Boolean) as string[]
   );
 
-  const segmentCols = headers.filter((h) => !reserved.has(h));
+  const segmentCols = headers.filter((h) => !reserved.has(h) && !/^Column_\d+$/.test(h));
 
   return {
     headers,
@@ -426,7 +587,7 @@ export function inspectUniversalLossGrid(
     originCol,
     devMode,
     devOrValCol,
-    wideValueCols: [],
+    wideValueCols: candidateWideCols,
     paidLossCol,
     incurredLossCol,
     caseReserveCol,
@@ -458,8 +619,23 @@ export function ingestUniversalLossGrid(
   availableGranularities: TimeGranularity[];
   diagnostics: DataHealthDiagnostics;
 } {
-  const rawHeaders = grid[headerRowIndex].map((h, i) => h.trim() || `Column_${i + 1}`);
+  const rawRow = grid[headerRowIndex] ?? [];
+  const parentRow = headerRowIndex > 0 ? grid[headerRowIndex - 1] ?? [] : [];
   const dataRows = grid.slice(headerRowIndex + 1).filter((r) => r.some((c) => c.trim() !== ''));
+  const maxColLen = Math.max(rawRow.length, ...dataRows.slice(0, 10).map((r) => r.length));
+
+  const usedNames = new Set<string>();
+  const rawHeaders: string[] = [];
+  for (let i = 0; i < maxColLen; i++) {
+    const primary = (rawRow[i] ?? '').trim();
+    const parent = (parentRow[i] ?? '').trim();
+    let candidate = primary || parent || `Column_${i + 1}`;
+    if (usedNames.has(candidate)) {
+      candidate = `${candidate}_${i + 1}`;
+    }
+    usedNames.add(candidate);
+    rawHeaders.push(candidate);
+  }
 
   const idxOf = (col?: string) => (col ? rawHeaders.findIndex((h) => h === col) : -1);
 
@@ -492,17 +668,30 @@ export function ingestUniversalLossGrid(
   const normRows: string[] = [normHeader.join(',')];
 
   if (config.detectedShape === 'wide_pivot') {
-    const wideCols =
+    let wideCols =
       config.wideValueCols.length > 0
-        ? config.wideValueCols
+        ? config.wideValueCols.filter((c) => idxOf(c) !== -1)
         : rawHeaders.filter((h) => parseWideDevOrPeriodHeader(h).isWideValueCol);
+
+    if (wideCols.length === 0) {
+      // Fallback: use all columns after iOrigin that are not reserved segment/premium columns
+      const reservedSet = new Set([
+        config.originCol,
+        config.metricTypeCol,
+        config.premiumCol,
+        config.exposureCol,
+        config.elrCol,
+        ...segCols,
+      ]);
+      wideCols = rawHeaders.filter((h, idx) => idx > iOrigin && !reservedSet.has(h));
+    }
 
     if (wideCols.length === 0) {
       throw new Error('No development lag or period columns selected for Wide Pivot mode.');
     }
 
     const firstWideSpec = parseWideDevOrPeriodHeader(wideCols[0]);
-    const effectiveDevMode = firstWideSpec.mode;
+    const effectiveDevMode = firstWideSpec.isWideValueCol ? firstWideSpec.mode : 'lag';
 
     // Group unpivoted cells by (segVals + originVal + devToken) so multi-metric Wide Pivot rows merge cleanly!
     interface MergedWideCell {
@@ -546,17 +735,25 @@ export function ingestUniversalLossGrid(
           ? 'count'
           : 'paid';
 
-      for (const wCol of wideCols) {
+      for (let wPos = 0; wPos < wideCols.length; wPos++) {
+        const wCol = wideCols[wPos];
         const wIdx = idxOf(wCol);
         if (wIdx === -1) continue;
         const numVal = parseCleanActuarialNumber(row[wIdx]);
         if (numVal === null) continue;
 
         const wSpec = parseWideDevOrPeriodHeader(wCol);
+        const digitFallback = Number(wCol.replace(/[^0-9]/g, ''));
         const devToken =
           effectiveDevMode === 'valuation_period'
             ? wSpec.periodRaw ?? wCol
-            : String(wSpec.lagValue ?? wCol.replace(/[^0-9]/g, ''));
+            : String(
+                wSpec.lagValue !== undefined
+                  ? wSpec.lagValue
+                  : wCol.replace(/[^0-9]/g, '') !== '' && !Number.isNaN(digitFallback)
+                  ? digitFallback
+                  : (wPos + 1) * 12
+              );
 
         const key = `${segVals.join('|')}__${originVal}__${devToken}`;
         const existing = mergedMap.get(key) ?? {
@@ -1136,4 +1333,168 @@ export function generateWarekiMultiMetricAndEdgeCaseSample(): {
     thousandYenSeparatePremCsv: thousandYenSeparatePremRows.join('\n'),
   };
 }
+
+/**
+ * Direct 2D Triangle Matrix Extractor (WTW ResQ Single-Triangle Mode):
+ * Extracts a clean 2D Run-Off Triangle directly from any Excel sheet or CSV/TSV grid
+ * (even when there are title rows above, empty top-left header cells, or no Premium/Segment columns).
+ */
+export function extractDirectTriangleFromGrid(
+  grid: string[][],
+  explicitHeaderRowIndex?: number,
+  unitMultiplier = 1
+): {
+  originLabels: string[];
+  devPeriods: number[];
+  triangle: (number | null)[][];
+  earnedPremium: number[];
+  exposureCount: number[];
+  aprioriElr: number;
+  headerRowIndex: number;
+} {
+  if (!grid || grid.length === 0) {
+    throw new Error('Grid is empty.');
+  }
+
+  const headerRowIndex =
+    explicitHeaderRowIndex !== undefined
+      ? explicitHeaderRowIndex
+      : detectBestHeaderRowIndex(grid);
+
+  const headerRow = grid[headerRowIndex] ?? [];
+  const dataRows = grid
+    .slice(headerRowIndex + 1)
+    .filter((r) => r.some((c) => (c ?? '').trim() !== ''));
+
+  if (dataRows.length < 2) {
+    throw new Error('Triangle grid must contain at least 2 origin rows.');
+  }
+
+  // Find which column holds the Origin labels (usually col 0, or col 1 if col 0 is blank margin)
+  let originColIdx = 0;
+  for (let c = 0; c < Math.min(4, headerRow.length); c++) {
+    const validDates = dataRows
+      .slice(0, 10)
+      .filter((r) => parseFlexiblePeriodString(r[c] ?? '') !== null).length;
+    if (validDates >= Math.min(2, dataRows.length)) {
+      originColIdx = c;
+      break;
+    }
+  }
+
+  // Check if any column after originColIdx is Earned Premium, Exposure, or ELR
+  let premColIdx = -1;
+  let expColIdx = -1;
+  let elrColIdx = -1;
+  const devColIndices: number[] = [];
+  const devPeriods: number[] = [];
+
+  for (let c = originColIdx + 1; c < headerRow.length; c++) {
+    const h = (headerRow[c] ?? '').trim();
+    const hLow = h.toLowerCase();
+    if (/prem|earned|\bep\b|\bgwp\b|保険料|既経過/.test(hLow)) {
+      premColIdx = c;
+      continue;
+    }
+    if (/exposure|policy|count|契約件数|経過契約|台数/.test(hLow)) {
+      expColIdx = c;
+      continue;
+    }
+    if (/elr|loss_ratio|apriori|損害率|予定損害率/.test(hLow)) {
+      elrColIdx = c;
+      continue;
+    }
+    // Check if column has at least one numeric cell in dataRows
+    const hasNumeric = dataRows.some((r) => parseCleanActuarialNumber(r[c]) !== null);
+    if (!hasNumeric) continue;
+
+    devColIndices.push(c);
+    const spec = parseWideDevOrPeriodHeader(h);
+    if (spec.lagValue !== undefined && spec.lagValue > 0) {
+      devPeriods.push(spec.lagValue);
+    } else {
+      const numMatch = h.match(/\d+/);
+      const parsed = numMatch ? Number(numMatch[0]) : NaN;
+      devPeriods.push(
+        !Number.isNaN(parsed) && parsed > 0 && parsed <= 360
+          ? parsed
+          : devColIndices.length * 12
+      );
+    }
+  }
+
+  if (devColIndices.length < 2) {
+    throw new Error('Could not detect at least 2 numeric development columns in the selected grid.');
+  }
+
+  const mult = unitMultiplier > 0 ? unitMultiplier : 1;
+  const originLabels: string[] = [];
+  const triangle: (number | null)[][] = [];
+  const earnedPremium: number[] = [];
+  const exposureCount: number[] = [];
+  const elrList: number[] = [];
+
+  for (let rIdx = 0; rIdx < dataRows.length; rIdx++) {
+    const row = dataRows[rIdx];
+    const rawOrigin = (row[originColIdx] ?? '').trim();
+    // Skip summary/total rows at the bottom of Excel tables
+    if (/^(total|sum|all|合計|総計|計|平均|average|vw|ldf)$/i.test(rawOrigin)) {
+      continue;
+    }
+
+    const rowVals = devColIndices.map((cIdx) => {
+      const v = parseCleanActuarialNumber(row[cIdx]);
+      return v !== null ? v * mult : null;
+    });
+
+    if (rowVals.every((v) => v === null)) continue;
+
+    const pInfo = parseFlexiblePeriodString(rawOrigin);
+    originLabels.push(rawOrigin || pInfo?.rawLabel || `AY-${rIdx + 1}`);
+    triangle.push(rowVals);
+
+    const nonNulls = rowVals.filter((v): v is number => v !== null);
+    const latestLoss = nonNulls.length > 0 ? Math.abs(nonNulls[nonNulls.length - 1]) : 1000;
+    const maturity = Math.max(0.35, nonNulls.length / Math.max(1, devColIndices.length));
+
+    const premRaw = premColIdx !== -1 ? parseCleanActuarialNumber(row[premColIdx]) : null;
+    const premVal =
+      premRaw !== null && premRaw > 0
+        ? premRaw * mult
+        : Math.max(100, Math.round((latestLoss / maturity) * 1.4));
+    earnedPremium.push(premVal);
+
+    const expRaw = expColIdx !== -1 ? parseCleanActuarialNumber(row[expColIdx]) : null;
+    const expVal =
+      expRaw !== null && expRaw > 0
+        ? expRaw
+        : Math.max(10, Math.round(premVal / Math.max(1, 80 * mult)));
+    exposureCount.push(expVal);
+
+    const elrRaw = elrColIdx !== -1 ? parseCleanActuarialNumber(row[elrColIdx]) : null;
+    if (elrRaw !== null && elrRaw > 0) {
+      elrList.push(elrRaw > 2 ? elrRaw / 100 : elrRaw);
+    }
+  }
+
+  if (triangle.length < 2) {
+    throw new Error('At least 2 valid origin rows with numeric cells are required.');
+  }
+
+  const aprioriElr =
+    elrList.length > 0
+      ? Number((elrList.reduce((a, b) => a + b, 0) / elrList.length).toFixed(4))
+      : 0.72;
+
+  return {
+    originLabels,
+    devPeriods,
+    triangle,
+    earnedPremium,
+    exposureCount,
+    aprioriElr,
+    headerRowIndex,
+  };
+}
+
 

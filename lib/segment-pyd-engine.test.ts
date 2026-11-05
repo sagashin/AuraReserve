@@ -577,5 +577,52 @@ test('Display Unit Divisor (1,000 / 1,000,000) scales Segment Attribution Roll-U
   assert.ok(normRes.wideRows.length > 1, 'Should populate Normalized_Wide_Matrix rows');
 });
 
+test('Corporate Excel/CSV Edge Cases: Header Row Auto-Detection past Title Rows, Bare Wareki (R5/H30), Timestamps, Lag 0, and Direct 2D Triangle Matrix Extraction', () => {
+  // 1. Test bare Wareki, SQL/Excel timestamps, and fiscal year ending strings
+  assert.equal(parseFlexiblePeriodString('R5')?.year, 2023);
+  assert.equal(parseFlexiblePeriodString('H30')?.year, 2018);
+  assert.equal(parseFlexiblePeriodString('令和5')?.year, 2023);
+  assert.equal(parseFlexiblePeriodString('2023-04-15 00:00:00')?.year, 2023);
+  assert.equal(parseFlexiblePeriodString('2023-04-15 00:00:00')?.month, 4);
+  assert.equal(parseFlexiblePeriodString('2023年3月期')?.year, 2022); // Fiscal Year ending March 2023 = FY2022
+  assert.equal(parseFlexiblePeriodString('AY2021')?.year, 2021);
+  assert.equal(parseFlexiblePeriodString('第4期')?.year, 2004);
+
+  // 2. Test Excel/CSV with 4 title/metadata rows at the top and development lag 0 ("0", "1年目", "2年目")
+  const corporateSheetText = [
+    '【社外秘】2023年度末 支払備金・IBNR推計用ワークシート,,,',
+    '作成部署：数理部,単位：千円,,',
+    '出力日時：2024/04/10 09:30:00,,,',
+    ',,,',
+    '商品区分,事故年度,0,1年目,2年目',
+    '自動車対人,R3,1200,2450,3100',
+    '自動車対人,R4,1350,2680,',
+    '自動車対人,R5,1490,,',
+  ].join('\n');
+
+  const parsedGrid = parseTextToRawGrid(corporateSheetText);
+  assert.equal(
+    parsedGrid.suggestedHeaderRowIndex,
+    4,
+    'Should automatically skip 4 corporate title/blank rows and detect header at index 4 (Row 5)'
+  );
+
+  const preview = inspectUniversalLossGrid(
+    parsedGrid.grid,
+    parsedGrid.suggestedHeaderRowIndex
+  );
+  assert.equal(preview.detectedShape, 'wide_pivot');
+  assert.deepEqual(preview.wideValueCols, ['0', '1年目', '2年目']);
+
+  const ingested = ingestUniversalLossGrid(
+    parsedGrid.grid,
+    parsedGrid.suggestedHeaderRowIndex,
+    preview,
+    'R5'
+  );
+  assert.ok(ingested.records.length >= 6, 'Should ingest all non-empty cells including lag 0 and bare R3/R4/R5 origins');
+});
+
+
 
 

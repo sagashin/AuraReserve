@@ -10,7 +10,8 @@ export interface AuditLogEntry {
     | 'ELR_EDIT'
     | 'AUTO_OPTIMIZE'
     | 'DATASET_LOAD'
-    | 'BOOTSTRAP_RUN';
+    | 'BOOTSTRAP_RUN'
+    | string;
   title: string;
   detail: string;
   previousIbnr: number;

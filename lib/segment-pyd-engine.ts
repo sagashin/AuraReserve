@@ -7,6 +7,7 @@
 import {
   ActuarialInput,
   ActuarialEvaluationResult,
+  LdfSelectionMode,
   evaluateActuarialModel,
 } from './actuarial-engine';
 
@@ -1533,7 +1534,7 @@ export interface ParsedPeriodInfo {
 }
 
 /**
- * Normalize full-width digits/letters and convert Japanese Wareki (令和/平成/昭和, R/H/S) to Western year
+ * Normalize full-width digits/letters, strip SQL/Excel timestamps, and convert Japanese Wareki (令和/平成/昭和, R/H/S) to Western year
  */
 function normalizeJapaneseDateToken(raw: string): {
   normalized: string;
@@ -1541,16 +1542,20 @@ function normalizeJapaneseDateToken(raw: string): {
 } {
   let s = raw
     .trim()
+    .replace(/^["']+|["']+$/g, '')
     .replace(/[０-９]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xfee0))
     .replace(/[Ａ-Ｚａ-ｚ]/g, (ch) =>
       String.fromCharCode(ch.charCodeAt(0) - 0xfee0)
     )
-    .replace(/　/g, ' ');
+    .replace(/　/g, ' ')
+    // Strip trailing timestamps like " 00:00:00", " 12:34:56.000", "T00:00:00Z"
+    .replace(/(?:[T\s]+\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)$/i, '')
+    .trim();
 
   let hadWareki = false;
-  // Convert 令和 / 平成 / 昭和 or R / H / S prefixes to 4-digit Western year
+  // Convert 令和 / 平成 / 昭和 or R / H / S prefixes (including bare "R5", "H30", "令和5") to 4-digit Western year
   s = s.replace(
-    /^(?:(令和|平成|昭和)|([RrHhSs]))\s*(元|\d{1,2})\s*(?:年度|年|[-/.])(.*)$/,
+    /^(?:(令和|平成|昭和)|([RrHhSs]))\s*(元|\d{1,2})(?:\s*(?:年度|年|期|[-/.])\s*(.*))?$/,
     (_, kanjiEra, alphaEra, yrToken, rest) => {
       hadWareki = true;
       const eraNum = yrToken === '元' ? 1 : Number(yrToken);
@@ -1572,11 +1577,13 @@ function normalizeJapaneseDateToken(raw: string): {
 /**
  * Parse any origin or valuation period string:
  * Supports:
- * - Japanese Wareki: '令和5年4月', '令和5年度', '令和元年10月', 'R5.4', 'R05/04', 'H30年度'
- * - Japanese Kanji: '2023年4月', '2023年04月15日', '2023年度', '2023年第2四半期', '2023年上期', '2023年下期'
+ * - Japanese Wareki: '令和5年4月', '令和5年度', '令和5', 'R5', 'R05', 'R5.4', 'R05/04', 'H30年度', 'H30'
+ * - Japanese Kanji: '2023年4月', '2023年04月15日', '2023年度', '2023年3月期', '2023年第2四半期', '2023年上期', '2023年下期'
  * - 8-digit compact numeric dates: '20230415' (YYYYMMDD)
- * - Slash & ISO dates: '2023/4/15', '04/15/2023', '2019-04', '201904', '2020-Q2', 'FY2021', '2018'
+ * - Slash, ISO & Timestamp dates: '2023/4/15', '2023-04-15 00:00:00', '04/15/2023', '2019-04', '201904', '2020-Q2', 'FY2021', 'AY2021', 'UY2021', '2018'
+ * - English Month names: 'Apr-2023', '15-Apr-2023', '2023-Apr'
  * - Excel serial dates: '44927' (30000..60000)
+ * - Sequential cohort numbers: '1'..'50', '第1期', 'Cohort 1'
  */
 export function parseFlexiblePeriodString(raw: string): ParsedPeriodInfo | null {
   if (!raw) return null;
@@ -1585,9 +1592,27 @@ export function parseFlexiblePeriodString(raw: string): ParsedPeriodInfo | null 
 
   const fmtTag = (base: string) => (hadWareki ? `和暦 (${base})` : base);
 
+  // 0. Corporate Fiscal Year ending month: '2023年3月期', '2023年12月期' -> Annual Fiscal Year
+  const kessanMatch = s.match(/^(\d{4})\s*年\s*(\d{1,2})\s*月\s*期$/);
+  if (kessanMatch) {
+    const endYear = Number(kessanMatch[1]);
+    const endMonth = Number(kessanMatch[2]);
+    const fyYear = endMonth <= 3 ? endYear - 1 : endYear;
+    return {
+      kind: 'annual',
+      year: fyYear,
+      month: 12,
+      quarter: 4,
+      fiscalYearApr: fyYear,
+      serialMonths: fyYear * 12 + 11,
+      rawLabel: `${fyYear}`,
+      detectedFormatLabel: fmtTag('決算期 (YYYY年M月期)'),
+    };
+  }
+
   // 1. Quarter & Half-Year patterns: '2023-Q2', '2023Q2', '2023年第2四半期', '2023年2Q', '2023年度1Q', '2023年上期', '2023年下期'
   const qKanjiMatch = s.match(
-    /^(?:FY|CY)?(\d{4})\s*(?:年度|年)?[-/\s]*(?:第\s*([1-4])\s*四半期|[Qq]([1-4])|([1-4])[Qq])/
+    /^(?:FY|CY|AY|UY|PY)?\s*(\d{4})\s*(?:年度|年)?[-/\s]*(?:第\s*([1-4])\s*四半期|[Qq]([1-4])|([1-4])[Qq])/i
   );
   if (qKanjiMatch) {
     const year = Number(qKanjiMatch[1]);
@@ -1607,7 +1632,7 @@ export function parseFlexiblePeriodString(raw: string): ParsedPeriodInfo | null 
   }
 
   const halfMatch = s.match(
-    /^(?:FY|CY)?(\d{4})\s*(?:年度|年)?[-/\s]*(上期|上半期|1H|H1|下期|下半期|2H|H2)$/i
+    /^(?:FY|CY|AY|UY|PY)?\s*(\d{4})\s*(?:年度|年)?[-/\s]*(上期|上半期|1H|H1|下期|下半期|2H|H2)$/i
   );
   if (halfMatch) {
     const year = Number(halfMatch[1]);
@@ -1684,8 +1709,8 @@ export function parseFlexiblePeriodString(raw: string): ParsedPeriodInfo | null 
     };
   }
 
-  // 5. US/EU slash date: MM/DD/YYYY or M/D/YYYY
-  const mdyMatch = s.match(/^(\d{1,2})\/(\d{1,2})\/(19\d{2}|20\d{2})$/);
+  // 5. US/EU slash or dash date: MM/DD/YYYY or DD/MM/YYYY or M/D/YYYY
+  const mdyMatch = s.match(/^(\d{1,2})[-/](\d{1,2})[-/](19\d{2}|20\d{2})$/);
   if (mdyMatch) {
     const p1 = Number(mdyMatch[1]);
     const p2 = Number(mdyMatch[2]);
@@ -1703,6 +1728,33 @@ export function parseFlexiblePeriodString(raw: string): ParsedPeriodInfo | null 
       rawLabel: `${year}-${String(month).padStart(2, '0')}`,
       detectedFormatLabel: 'スラッシュ日付 (M/D/YYYY)',
     };
+  }
+
+  // 5b. English Month names: 'Apr-2023', '15-Apr-2023', '2023-Apr', 'Apr 2023'
+  const engMonths: Record<string, number> = {
+    jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6,
+    jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12,
+  };
+  const engMatch1 = s.match(/^(?:\d{1,2}[-\s/])?([A-Za-z]{3})[a-z]*[-\s/,]+(19\d{2}|20\d{2})$/);
+  const engMatch2 = s.match(/^(19\d{2}|20\d{2})[-\s/]([A-Za-z]{3})[a-z]*(?:[-\s/]\d{1,2})?$/);
+  if (engMatch1 || engMatch2) {
+    const mKey = (engMatch1 ? engMatch1[1] : engMatch2![2]).toLowerCase();
+    const yr = Number(engMatch1 ? engMatch1[2] : engMatch2![1]);
+    const month = engMonths[mKey];
+    if (month) {
+      const quarter = Math.ceil(month / 3);
+      const fiscalYearApr = month >= 4 ? yr : yr - 1;
+      return {
+        kind: 'monthly',
+        year: yr,
+        month,
+        quarter,
+        fiscalYearApr,
+        serialMonths: yr * 12 + (month - 1),
+        rawLabel: `${yr}-${String(month).padStart(2, '0')}`,
+        detectedFormatLabel: '英語年月 (MMM-YYYY)',
+      };
+    }
   }
 
   // 6. 6-digit YYYYMM: '202304'
@@ -1747,8 +1799,10 @@ export function parseFlexiblePeriodString(raw: string): ParsedPeriodInfo | null 
     }
   }
 
-  // 8. Annual: '2023年度', '2023年', 'FY2023', 'CY2023', '2023'
-  const yrMatch = s.match(/^(?:FY|CY)?(19\d{2}|20\d{2})\s*(?:年度|年|期)?$/i) || s.match(/(?:FY|CY)?(19\d{2}|20\d{2})/i);
+  // 8. Annual: '2023年度', '2023年', 'FY2023', 'CY2023', 'AY2023', 'UY2023', 'PY2023', '2023'
+  const yrMatch =
+    s.match(/^(?:FY|CY|AY|UY|PY)?\s*(19\d{2}|20\d{2})\s*(?:FY|CY|AY|UY|PY|年度|年|期)?$/i) ||
+    s.match(/(?:FY|CY|AY|UY|PY)?\s*(19\d{2}|20\d{2})/i);
   if (yrMatch) {
     const year = Number(yrMatch[1]);
     const isFy = /FY|年度/i.test(raw) || hadWareki;
@@ -1764,11 +1818,68 @@ export function parseFlexiblePeriodString(raw: string): ParsedPeriodInfo | null 
     };
   }
 
+  // 9. Sequential Cohort Index: '第1期', '1期', 'AY1', 'Year 1', or small cohort index '1'..'30'
+  const seqMatch = s.match(/^(?:第\s*)?(\d{1,2})\s*(?:期|年度|年目)$/) || s.match(/^(?:AY|UY|PY|Year|Cohort)\s*(\d{1,2})$/i);
+  if (seqMatch) {
+    const idx = Number(seqMatch[1]);
+    if (idx >= 1 && idx <= 50) {
+      const year = 2000 + idx;
+      return {
+        kind: 'annual',
+        year,
+        month: 12,
+        quarter: 4,
+        fiscalYearApr: year,
+        serialMonths: year * 12 + 11,
+        rawLabel: `${year}`,
+        detectedFormatLabel: '期別インデックス (第N期)',
+      };
+    }
+  }
+
   return null;
+}
+
+/**
+ * RFC-4180 quote-aware and delimiter-aware (`,`, `\t`, `;`) row splitter
+ */
+function splitCsvOrTsvRow(line: string, delimiter: ',' | '\t' | ';' = ','): string[] {
+  const result: string[] = [];
+  let current = '';
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') {
+      if (inQuotes && line[i + 1] === '"') {
+        current += '"';
+        i++;
+      } else {
+        inQuotes = !inQuotes;
+      }
+    } else if (ch === delimiter && !inQuotes) {
+      result.push(current.trim());
+      current = '';
+    } else {
+      current += ch;
+    }
+  }
+  result.push(current.trim());
+  return result;
+}
+
+function detectDelimiterFromLines(lines: string[]): ',' | '\t' | ';' {
+  const sample = lines[Math.min(1, lines.length - 1)] ?? '';
+  const tabs = (sample.match(/\t/g) ?? []).length;
+  const semis = (sample.match(/;/g) ?? []).length;
+  const commas = (sample.match(/,/g) ?? []).length;
+  if (tabs > commas && tabs >= semis) return '\t';
+  if (semis > commas) return ';';
+  return ',';
 }
 
 export function inspectCsvHeadersAndPreview(csvText: string): CsvHeaderPreviewResult {
   const lines = csvText
+    .replace(/^\uFEFF/, '')
     .trim()
     .split(/\r?\n/)
     .map((l) => l.trim())
@@ -1778,11 +1889,12 @@ export function inspectCsvHeadersAndPreview(csvText: string): CsvHeaderPreviewRe
     throw new Error('CSV must include a header row and at least one data row.');
   }
 
-  const headers = lines[0].split(',').map((h) => h.trim());
+  const delimiter = detectDelimiterFromLines(lines);
+  const headers = splitCsvOrTsvRow(lines[0], delimiter).map((h, i) => h || `Column_${i + 1}`);
   const sampleRows: Record<string, string>[] = [];
 
   for (let i = 1; i < Math.min(lines.length, 6); i++) {
-    const parts = lines[i].split(',').map((c) => c.trim());
+    const parts = splitCsvOrTsvRow(lines[i], delimiter);
     const rowObj: Record<string, string> = {};
     headers.forEach((h, idx) => {
       rowObj[h] = parts[idx] ?? '';
@@ -1794,12 +1906,12 @@ export function inspectCsvHeadersAndPreview(csvText: string): CsvHeaderPreviewRe
     headers.find((h) => patterns.some((p) => p.test(h.toLowerCase())));
 
   const originCol =
-    findHeader([/origin|accident|incurral|事故|発生年月|発生年度|契約年度/]) ??
+    findHeader([/origin|accident|incurral|underwriting|policy_year|\bay\b|\buy\b|\bpy\b|事故|発生年月|発生年度|契約年度|対象年度|年度/]) ??
     headers[0];
 
-  const lagCol = findHeader([/dev|lag|elapsed|進展|経過/]);
+  const lagCol = findHeader([/dev|lag|elapsed|進展|経過|月数|年数/]);
   const valPeriodCol = findHeader([
-    /valuation|calendar|accounting|eval|paid_period|評価年月|支払年月|会計年月|決済年月/,
+    /valuation|calendar|accounting|eval|paid_period|評価年月|支払年月|会計年月|決済年月|集計年月/,
   ]);
 
   const devMode: 'lag' | 'valuation_period' =
@@ -1810,10 +1922,10 @@ export function inspectCsvHeadersAndPreview(csvText: string): CsvHeaderPreviewRe
 
   const incLossCol = findHeader([/incremental|期間損害|当期支払|単月支払/]);
   const cumLossCol = findHeader([
-    /cum|paid|loss|claim|amount|累積|支払損害|損害|支払|ロス/,
+    /cum|paid|loss|claim|amount|累積|支払損害|損害|支払|ロス|金額/,
   ]);
-  const incurredCol = findHeader([/incurred|発生損害|発生ロス/]);
-  const caseReserveCol = findHeader([/case|os_reserve|個別備金|支払備金残高/]);
+  const incurredCol = findHeader([/incurred|発生損害|発生ロス|既発生/]);
+  const caseReserveCol = findHeader([/case|os_reserve|outstanding|個別備金|支払備金残高|未払備金/]);
   const claimCountCol = findHeader([/count|claims|件数|クレーム件数|事故件数/]);
 
   const lossType: 'cumulative' | 'incremental' =
@@ -1824,8 +1936,8 @@ export function inspectCsvHeadersAndPreview(csvText: string): CsvHeaderPreviewRe
     (lossType === 'incremental' ? incLossCol : cumLossCol) ??
     headers[Math.min(2, headers.length - 1)];
 
-  const premiumCol = findHeader([/prem|earned|\bep\b|保険料|既経過/]) ?? '';
-  const exposureCol = findHeader([/exposure|policy_count|契約件数|経過契約|台数/]) ?? '';
+  const premiumCol = findHeader([/prem|earned|\bep\b|\bgwp\b|\bnwp\b|保険料|既経過|収入保険料/]) ?? '';
+  const exposureCol = findHeader([/exposure|policy_count|契約件数|経過契約|台数|エクスポージャー/]) ?? '';
   const elrCol = findHeader([/elr|loss_ratio|apriori|損害率|予定損害率/]) ?? '';
 
   const reservedCols = new Set(
@@ -1879,6 +1991,7 @@ export function ingestMappedCsvWithAutoRollup(
   diagnostics: DataHealthDiagnostics;
 } {
   const lines = csvText
+    .replace(/^\uFEFF/, '')
     .trim()
     .split(/\r?\n/)
     .map((l) => l.trim())
@@ -1888,7 +2001,8 @@ export function ingestMappedCsvWithAutoRollup(
     throw new Error('CSV must include a header row and data rows.');
   }
 
-  const headers = lines[0].split(',').map((h) => h.trim());
+  const delimiter = detectDelimiterFromLines(lines);
+  const headers = splitCsvOrTsvRow(lines[0], delimiter).map((h, i) => h || `Column_${i + 1}`);
   const idxOf = (colName?: string) =>
     colName ? headers.findIndex((h) => h === colName) : -1;
 
@@ -1917,6 +2031,24 @@ export function ingestMappedCsvWithAutoRollup(
       : 1;
   const fillGaps = mapping.fillInteriorGaps !== false;
 
+  const parseNumField = (raw?: string): number => {
+    if (!raw) return NaN;
+    let s = raw.trim().replace(/^["']+|["']+$/g, '');
+    if (!s || s === '-' || s === '—' || s === '―' || /^n\/?a$/i.test(s)) return NaN;
+    let neg = false;
+    if ((s.startsWith('(') && s.endsWith(')')) || s.startsWith('△') || s.startsWith('▲')) {
+      neg = true;
+      s = s.replace(/^[(\s△▲]+|[)\s]+$/g, '');
+    }
+    const isPct = s.endsWith('%') || s.endsWith('％');
+    const clean = s.replace(/[¥￥$€£,\s%％]/g, '');
+    if (!clean) return NaN;
+    const n = Number(clean);
+    if (Number.isNaN(n)) return NaN;
+    const signed = neg ? -Math.abs(n) : n;
+    return isPct && Math.abs(signed) > 1.5 ? signed / 100 : signed;
+  };
+
   interface NormalizedFactPoint {
     dims: Record<string, string>;
     segKey: string;
@@ -1929,8 +2061,8 @@ export function ingestMappedCsvWithAutoRollup(
     lossVal: number | null;
     incurredVal: number | null;
     countVal: number | null;
-    premium: number;
-    exposure: number;
+    premium: number | null;
+    exposure: number | null;
     elr: number;
   }
 
@@ -1939,7 +2071,7 @@ export function ingestMappedCsvWithAutoRollup(
   const dateFormatsSet = new Set<string>();
 
   for (let r = 1; r < lines.length; r++) {
-    const parts = lines[r].split(',').map((c) => c.trim());
+    const parts = splitCsvOrTsvRow(lines[r], delimiter);
     const originRaw = parts[iOrigin] ?? '';
     const originInfo = parseFlexiblePeriodString(originRaw);
     if (!originInfo) {
@@ -1950,20 +2082,10 @@ export function ingestMappedCsvWithAutoRollup(
       dateFormatsSet.add(originInfo.detectedFormatLabel);
     }
 
-    const rawLossStr = (parts[iLoss] ?? '').replace(/[^0-9.-]/g, '');
-    const rawLossNum = rawLossStr !== '' ? Number(rawLossStr) : NaN;
-    const rawInc =
-      iIncurred !== -1 && parts[iIncurred] !== ''
-        ? Number(parts[iIncurred].replace(/[^0-9.-]/g, ''))
-        : NaN;
-    const rawCase =
-      iCase !== -1 && parts[iCase] !== ''
-        ? Number(parts[iCase].replace(/[^0-9.-]/g, ''))
-        : NaN;
-    const rawCnt =
-      iCount !== -1 && parts[iCount] !== ''
-        ? Number(parts[iCount].replace(/[^0-9.-]/g, ''))
-        : NaN;
+    const rawLossNum = parseNumField(parts[iLoss]);
+    const rawInc = iIncurred !== -1 ? parseNumField(parts[iIncurred]) : NaN;
+    const rawCase = iCase !== -1 ? parseNumField(parts[iCase]) : NaN;
+    const rawCnt = iCount !== -1 ? parseNumField(parts[iCount]) : NaN;
 
     if (
       Number.isNaN(rawLossNum) &&
@@ -1996,8 +2118,9 @@ export function ingestMappedCsvWithAutoRollup(
         devLagRaw = Math.max(12, (valInfo.year - originInfo.year + 1) * 12);
       }
     } else {
-      const parsedLag = Number((parts[iDevOrVal] ?? '').replace(/[^0-9.]/g, ''));
-      if (Number.isNaN(parsedLag) || parsedLag <= 0) {
+      const devTokenRaw = (parts[iDevOrVal] ?? '').trim();
+      const parsedLag = Number(devTokenRaw.replace(/[^0-9.]/g, ''));
+      if (devTokenRaw === '' || Number.isNaN(parsedLag) || parsedLag < 0) {
         skippedRowsCount++;
         continue;
       }
@@ -2029,18 +2152,17 @@ export function ingestMappedCsvWithAutoRollup(
 
     const countVal = !Number.isNaN(rawCnt) ? rawCnt : null;
 
-    const premium =
-      iPrem !== -1 && !Number.isNaN(Number(parts[iPrem])) && Number(parts[iPrem]) > 0
-        ? Number(parts[iPrem]) * mult
-        : 2000000 * mult;
-    const exposure =
-      iExp !== -1 && !Number.isNaN(Number(parts[iExp])) && Number(parts[iExp]) > 0
-        ? Number(parts[iExp])
-        : Math.max(100, Math.round(premium / (80 * mult)));
+    const parsedPrem = iPrem !== -1 ? parseNumField(parts[iPrem]) : NaN;
+    const premium: number | null =
+      !Number.isNaN(parsedPrem) && parsedPrem > 0 ? parsedPrem * mult : null;
+
+    const parsedExp = iExp !== -1 ? parseNumField(parts[iExp]) : NaN;
+    const exposure: number | null =
+      !Number.isNaN(parsedExp) && parsedExp > 0 ? parsedExp : null;
+
+    const parsedElr = iElr !== -1 ? parseNumField(parts[iElr]) : NaN;
     const elr =
-      iElr !== -1 && !Number.isNaN(Number(parts[iElr])) && Number(parts[iElr]) > 0
-        ? Number(parts[iElr])
-        : 0.76;
+      !Number.isNaN(parsedElr) && parsedElr > 0 ? parsedElr : 0.72;
 
     rawPoints.push({
       dims,
@@ -2062,6 +2184,17 @@ export function ingestMappedCsvWithAutoRollup(
 
   if (rawPoints.length === 0) {
     throw new Error('No valid numeric triangle cells were found with the selected column mapping.');
+  }
+
+  // Normalize development lags if lag 0 is present (e.g. 0, 1, 2... -> 1, 2, 3...) so annual roll-up works cleanly
+  const minRawLag = Math.min(...rawPoints.map((p) => p.devLagRaw));
+  if (minRawLag === 0) {
+    const uniqueLags = Array.from(new Set(rawPoints.map((p) => p.devLagRaw))).sort((a, b) => a - b);
+    const step = uniqueLags.length >= 2 ? uniqueLags[1] - uniqueLags[0] : 12;
+    const shift = step >= 12 ? 12 : step === 3 ? 3 : 1;
+    for (const pt of rawPoints) {
+      pt.devLagRaw = pt.devLagRaw + shift;
+    }
   }
 
   let primaryInteriorGapsFilled = 0;
@@ -2086,8 +2219,8 @@ export function ingestMappedCsvWithAutoRollup(
       lossVal: number | null;
       incurredVal: number | null;
       countVal: number | null;
-      premium: number;
-      exposure: number;
+      premium: number | null;
+      exposure: number | null;
       elr: number;
     }
 
@@ -2191,13 +2324,22 @@ export function ingestMappedCsvWithAutoRollup(
       let totalPrem = 0;
       let totalExp = 0;
       let weightedElr = 0;
+      let hasExplicitPrem = false;
+      let hasExplicitExp = false;
+
       for (const so of subOrigins) {
         const subCell = cells.find((c) => c.subOriginKey === so)!;
-        totalPrem += subCell.premium;
-        totalExp += subCell.exposure;
-        weightedElr += subCell.premium * subCell.elr;
+        if (subCell.premium !== null && subCell.premium > 0) {
+          totalPrem += subCell.premium;
+          weightedElr += subCell.premium * subCell.elr;
+          hasExplicitPrem = true;
+        }
+        if (subCell.exposure !== null && subCell.exposure > 0) {
+          totalExp += subCell.exposure;
+          hasExplicitExp = true;
+        }
       }
-      const avgElr = totalPrem > 0 ? weightedElr / totalPrem : sample.elr;
+      const avgElr = hasExplicitPrem && totalPrem > 0 ? weightedElr / totalPrem : sample.elr;
 
       const maxDevObserved = Math.max(...cells.map((c) => c.devBucket));
       const buildSeries = (
@@ -2221,7 +2363,6 @@ export function ingestMappedCsvWithAutoRollup(
           for (const so of subOrigins) {
             const soCells = matchingDev.filter((c) => c.subOriginKey === so);
             if (soCells.length > 0) {
-              // Take latest observation within the sub-origin for that dev bucket
               sumCum += soCells[soCells.length - 1]
                 ? getter(soCells[soCells.length - 1]) ?? 0
                 : 0;
@@ -2254,7 +2395,6 @@ export function ingestMappedCsvWithAutoRollup(
             run = nextRun;
             cumRow.push(run);
           } else {
-            // Preserve genuine downward development (LDF < 1.0, e.g. reserve takedowns / salvage)
             if (countStats && run !== null && v < run) {
               primaryNegativeDevCells++;
             }
@@ -2275,6 +2415,19 @@ export function ingestMappedCsvWithAutoRollup(
       const claimCountRow = explicitCount ?? synth.claimCountRow;
 
       const nonNulls = cumulativeRow.filter((v): v is number => v !== null);
+      const latestObsLoss =
+        nonNulls.length > 0 ? Math.abs(nonNulls[nonNulls.length - 1]) : 0;
+
+      // Auto-scale fallback Earned Premium & Exposure proportionally to cohort's observed loss when not explicitly provided!
+      if (!hasExplicitPrem || totalPrem <= 0) {
+        const maturityFraction = Math.max(0.35, nonNulls.length / Math.max(1, allDevs.length));
+        const impliedUltimate = latestObsLoss / maturityFraction;
+        totalPrem = Math.max(100, Math.round(impliedUltimate / Math.max(0.4, avgElr)));
+      }
+      if (!hasExplicitExp || totalExp <= 0) {
+        totalExp = Math.max(10, Math.round(totalPrem / Math.max(1, 80 * mult)));
+      }
+
       const priorDiagVal =
         nonNulls.length >= 2
           ? nonNulls[nonNulls.length - 2]
@@ -2508,3 +2661,58 @@ export function generateCustomJapaneseFiscalSampleCsv(): string {
 
   return rows.join('\n');
 }
+
+export function getDefaultMultiSegmentFactStore(): MultiSegmentFactRecord[] {
+  return buildDefaultMultiSegmentFactStore();
+}
+
+export function evaluatePortfolioPriorYearDevelopment(
+  records: MultiSegmentFactRecord[],
+  valuationMonth: string,
+  granularity: TimeGranularity,
+  filters: Partial<SegmentFilterState> = {},
+  selectedLdfMode: LdfSelectionMode = 'vw_all',
+  tailFactor = 1.01,
+  _baselineValuationLabel?: string,
+  pydConfig?: PydConfiguration,
+  displayUnitDivisor = 1
+): PriorYearDevelopmentAnalysis {
+  const fullFilters: SegmentFilterState = {
+    product: filters.product ?? 'ALL',
+    channel: filters.channel ?? 'ALL',
+    coverage: filters.coverage ?? 'ALL',
+    region: filters.region ?? 'ALL',
+    ...filters,
+  };
+  const slice = pivotSegmentTriangle(
+    records,
+    valuationMonth,
+    granularity,
+    fullFilters
+  );
+  const n = slice.originCodes.length;
+  const m = slice.devPeriods.length;
+  const evalRes = evaluateActuarialModel({
+    originYears: slice.originCodes,
+    devPeriods: slice.devPeriods,
+    cumulativeTriangle: slice.cumulativeTriangle,
+    earnedPremium: slice.earnedPremium,
+    aprioriElr: slice.aprioriElr,
+    exclusions: Array.from({ length: n }, () =>
+      new Array(Math.max(0, m - 1)).fill(false)
+    ),
+    selectedLdfMode,
+    manualLdfs: new Array(Math.max(0, m - 1)).fill(null),
+    tailFactor,
+    selectedMethods: new Array(n).fill('CL'),
+    methodWeights: Array.from({ length: n }, () => ({ cl: 1, bf: 0, cc: 0 })),
+  });
+  return computePriorYearDevelopmentAndRollup(
+    records,
+    slice,
+    evalRes,
+    pydConfig,
+    displayUnitDivisor
+  );
+}
+
